@@ -1,0 +1,7 @@
+/* Auto-split from the previous styles.css. Keep rules in this file in their current order. */
+
+/* =========================================================
+   ANIMATIONS
+========================================================= */
+
+@keyframes mania-spin { to { transform: rotate(360deg); } }

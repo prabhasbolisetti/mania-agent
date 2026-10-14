@@ -1,0 +1,40 @@
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+cookies.txt
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Node / React
+node_modules/
+ui/node_modules/
+dist/
+ui/dist/
+.vite/
+ui/.vite/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Backups, logs, generated archives
+*-backup-*/
+*.bak
+*.backup
+*.log
+*.zip
+
+# Private customer data
+data/leads/

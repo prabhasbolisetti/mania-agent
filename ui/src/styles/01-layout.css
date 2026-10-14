@@ -1,0 +1,125 @@
+/* Auto-split from the previous styles.css. Keep rules in this file in their current order. */
+
+/* =========================================================
+   LAYOUT WRAPPERS
+========================================================= */
+
+.dashboard-layout, .lead-details-layout { width: 100%; min-height: 100vh; margin: 0; padding: 0; background: var(--mania-bg); }
+
+/* =========================================================
+   MAIN CONTENT
+========================================================= */
+
+.dashboard-main,
+.lead-details-content {
+  width: calc(100% - var(--mania-sidebar-open));
+  min-width: 0;
+  min-height: 100vh;
+  margin-left: var(--mania-sidebar-open);
+  transition:
+    width var(--mania-layout-speed) var(--mania-layout-ease),
+    margin-left var(--mania-layout-speed) var(--mania-layout-ease),
+    padding var(--mania-layout-speed) var(--mania-layout-ease);
+}
+
+.dashboard-main { padding: 30px 34px 50px; }
+
+.lead-details-content {
+  position: relative;
+  z-index: 1;
+  padding: 34px 38px 55px;
+  overflow-x: hidden;
+  background: var(--mania-bg);
+}
+
+.dashboard-container, .lead-details-container { width: 100%; min-width: 0; margin: 0 auto; }
+.dashboard-container { max-width: 1500px; }
+.lead-details-container { max-width: 1450px; }
+
+/* =========================================================
+   COLLAPSED SIDEBAR (desktop only)
+========================================================= */
+
+@media (min-width: 901px) {
+  body.sidebar-collapsed .app-sidebar { width: var(--mania-sidebar-collapsed); }
+
+  body.sidebar-collapsed .dashboard-main,
+  body.sidebar-collapsed .lead-details-content {
+    width: calc(100% - var(--mania-sidebar-collapsed));
+    margin-left: var(--mania-sidebar-collapsed);
+  }
+
+  /* Brand: logo stays centred, arrow sits on the right edge */
+  body.sidebar-collapsed .sidebar-brand { justify-content: center; gap: 0; padding: 0; }
+
+  body.sidebar-collapsed .sidebar-brand-text {
+    position: absolute;
+    width: 0;
+    max-width: 0;
+    margin: 0;
+    padding: 0;
+    opacity: 0;
+    transform: translateX(-8px);
+    pointer-events: none;
+  }
+
+  body.sidebar-collapsed .sidebar-collapse-button {
+    top: 12px;
+    right: -14px;
+    z-index: 500;
+    width: 28px;
+    height: 28px;
+    min-width: 28px;
+    border-color: rgba(255, 255, 255, 0.12);
+    background: #172337;
+    color: #aab7ca;
+    box-shadow: 0 5px 16px rgba(0, 0, 0, 0.25), 0 0 0 1px rgba(255, 255, 255, 0.02);
+  }
+
+  body.sidebar-collapsed .sidebar-collapse-button:hover { background: #22324b; color: #ffffff; }
+
+  /* Navigation */
+  body.sidebar-collapsed .sidebar-navigation { margin-top: 30px; }
+  body.sidebar-collapsed .sidebar-section-label { height: 0; padding-top: 0; padding-bottom: 0; opacity: 0; overflow: hidden; }
+  body.sidebar-collapsed .sidebar-nav-item { justify-content: center; gap: 0; padding-left: 0; padding-right: 0; }
+  body.sidebar-collapsed .sidebar-nav-label { position: absolute; width: 0; opacity: 0; transform: translateX(-8px); pointer-events: none; }
+  body.sidebar-collapsed .sidebar-nav-arrow { display: none; }
+
+  /* Footer */
+  body.sidebar-collapsed .sidebar-user { justify-content: center; padding-left: 0; padding-right: 0; }
+  body.sidebar-collapsed .sidebar-user-info { width: 0; max-width: 0; opacity: 0; transform: translateX(-8px); pointer-events: none; }
+  body.sidebar-collapsed .sidebar-logout { justify-content: center; padding-left: 0; padding-right: 0; }
+  body.sidebar-collapsed .sidebar-logout span,
+  body.sidebar-collapsed .sidebar-security span:last-child { display: none; }
+  body.sidebar-collapsed .sidebar-security { justify-content: center; padding-left: 0; padding-right: 0; }
+}
+
+/* ============================================================
+   MAIN CONTENT — CRITICAL FIX
+   ============================================================ */
+
+.dashboard-main,
+.lead-details-content {
+  width:
+    calc(100% - 250px) !important;
+
+  margin-left: 250px !important;
+
+  min-width: 0 !important;
+
+  box-sizing: border-box !important;
+
+  transition: none !important;
+}
+
+
+/*
+   Remove any previous collapsed positioning.
+*/
+body.sidebar-collapsed .dashboard-main,
+body.sidebar-collapsed .lead-details-content {
+  width:
+    calc(100% - 250px) !important;
+
+  margin-left: 250px !important;
+}

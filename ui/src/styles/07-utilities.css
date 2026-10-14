@@ -1,0 +1,38 @@
+/* Auto-split from the previous styles.css. Keep rules in this file in their current order. */
+
+/* =========================================================
+   LEGACY / OPTIONAL CONTROLS
+========================================================= */
+
+.filter-select { height: 38px; min-width: 120px; padding: 0 10px; border: 1px solid #dfe3ea; border-radius: 8px; outline: 0; background: #ffffff; color: #374151; font-size: 12px; }
+.search-input { width: 230px; height: 38px; padding: 0 12px; border: 1px solid #dfe3ea; border-radius: 8px; outline: 0; background: #ffffff; color: #111827; font-size: 12px; }
+.filter-select:focus, .search-input:focus { border-color: #2563eb; box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.08); }
+
+.leads-section { width: 100%; overflow: hidden; border: 1px solid #e5e7eb; border-radius: 14px; background: #ffffff; }
+.leads-section-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 18px 20px; border-bottom: 1px solid #edf0f4; }
+.leads-section-title { color: #111827; font-size: 15px; font-weight: 700; }
+.leads-section-subtitle { margin-top: 3px; color: #9ca3af; font-size: 11px; }
+.leads-toolbar { display: flex; align-items: center; gap: 10px; }
+
+.primary-button { height: 48px; border: 0; border-radius: 10px; background: linear-gradient(135deg, #2563eb, #1d4ed8); color: #ffffff; font-size: 14px; font-weight: 650; }
+
+/* =========================================================
+   ERROR ANIMATION
+========================================================= */
+
+@keyframes login-error-in {
+
+  from {
+    opacity: 0;
+
+    transform:
+      translateY(-4px);
+  }
+
+  to {
+    opacity: 1;
+
+    transform:
+      translateY(0);
+  }
+}

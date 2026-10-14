@@ -1,0 +1,77 @@
+/* Auto-split from the previous styles.css. Keep rules in this file in their current order. */
+
+/* =========================================================
+   TODAY DRAWER
+========================================================= */
+
+.today-drawer {
+  position: fixed;
+  inset: 0 0 0 auto;
+  z-index: 300;
+  width: min(410px, 92vw);
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  background: #ffffff;
+  border-left: 1px solid #e5e7eb;
+  box-shadow: -16px 0 45px rgba(15, 23, 42, 0.13);
+  transform: translateX(105%);
+  transition: transform 260ms var(--mania-layout-ease);
+}
+
+.today-drawer-open { transform: translateX(0); }
+
+.today-drawer-overlay { position: fixed; inset: 0; z-index: 290; width: 100%; height: 100%; padding: 0; border: 0; background: rgba(15, 23, 42, 0.34); backdrop-filter: blur(2px); }
+
+.today-drawer-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; padding: 25px 23px 20px; border-bottom: 1px solid #edf0f4; }
+.today-drawer-eyebrow { margin-bottom: 6px; color: #2563eb; font-size: 8px; font-weight: 800; letter-spacing: 0.12em; }
+.today-drawer-header h2 { margin: 0; color: #111827; font-size: 20px; font-weight: 760; }
+.today-drawer-header p { margin: 5px 0 0; color: #9ca3af; font-size: 10px; }
+
+.today-drawer-close { width: 34px; height: 34px; flex: 0 0 auto; display: flex; align-items: center; justify-content: center; border: 1px solid #e5e7eb; border-radius: 9px; background: #ffffff; color: #64748b; font-size: 21px; line-height: 1; }
+.today-drawer-close:hover { background: #f8fafc; color: #111827; }
+
+.today-highlight { display: flex; align-items: center; gap: 11px; margin: 18px 20px 14px; padding: 13px; border: 1px solid #dbeafe; border-radius: 10px; background: linear-gradient(135deg, #eff6ff, #f8fbff); }
+.today-highlight-icon { width: 32px; height: 32px; flex: 0 0 auto; display: flex; align-items: center; justify-content: center; border-radius: 9px; background: #2563eb; color: #ffffff; }
+.today-highlight strong, .today-highlight span { display: block; }
+.today-highlight strong { color: #1e3a8a; font-size: 10px; }
+.today-highlight span { margin-top: 3px; color: #64748b; font-size: 9px; }
+
+.today-mini-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 7px; padding: 0 20px 18px; }
+.today-mini-card { min-width: 0; padding: 11px 9px; border: 1px solid #edf0f4; border-radius: 8px; background: #fafbfc; }
+.today-mini-card span { display: block; overflow: hidden; color: #94a3b8; font-size: 7px; font-weight: 800; text-overflow: ellipsis; white-space: nowrap; }
+.today-mini-card strong { display: block; margin-top: 5px; color: #1f2937; font-size: 17px; }
+
+.today-drawer-section { padding: 17px 20px 25px; border-top: 1px solid #edf0f4; }
+.today-section-heading { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; color: #374151; font-size: 10px; font-weight: 750; }
+.today-section-heading > span:last-child { min-width: 20px; height: 20px; display: flex; align-items: center; justify-content: center; border-radius: 6px; background: #f1f5f9; color: #64748b; font-size: 8px; }
+
+.today-lead-list { display: flex; flex-direction: column; gap: 5px; }
+
+.today-lead-item {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 10px;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  background: #ffffff;
+  color: inherit;
+  text-align: left;
+  transition: border-color 140ms ease, background 140ms ease, transform 140ms ease;
+}
+
+.today-lead-item:hover { border-color: #dbeafe; background: #f8fbff; transform: translateX(2px); }
+
+.today-lead-avatar { width: 31px; height: 31px; flex: 0 0 auto; display: flex; align-items: center; justify-content: center; border-radius: 9px; background: #eff6ff; color: #2563eb; font-size: 9px; font-weight: 800; }
+.today-lead-info { min-width: 0; flex: 1; }
+.today-lead-info strong, .today-lead-info span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.today-lead-info strong { color: #334155; font-size: 10px; }
+.today-lead-info span { margin-top: 2px; color: #a1a9b5; font-size: 8px; }
+.today-lead-meta { flex: 0 0 auto; display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
+.today-lead-meta small { color: #a1a9b5; font-size: 7px; }
+
+.today-empty { min-height: 180px; display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 7px; color: #a1a9b5; text-align: center; }
+.today-empty-icon { width: 42px; height: 42px; display: flex; align-items: center; justify-content: center; border-radius: 12px; background: #f1f5f9; color: #94a3b8; font-size: 22px; }
