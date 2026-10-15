@@ -2,11 +2,11 @@
 """Meta WhatsApp Cloud API client with safe configuration and diagnostics.
 
 Configuration priority:
-1. Project-root .env file
-2. Process/deployment environment variables (fallback)
+1. Process/deployment environment variables (Render, etc.).
+2. Project-root .env file (local development fallback).
 
-The .env file is read afresh whenever configuration is requested, so
-editing the token does not require restarting the Python process.
+The .env file is read afresh whenever configuration is requested.
+Credentials are never intentionally printed in logs.
 """
 
 import hashlib
@@ -35,9 +35,17 @@ MAX_WHATSAPP_TEXT_LENGTH = 4096
 # ---------------------------------------------------------
 
 def _read_setting(name: str, default: str = "") -> str:
-    """Read .env first; use the process environment as fallback."""
+    """Read deployment environment first, then fall back to .env."""
 
-    # Read the file on every call. Do not rely on cached os.environ values.
+    # Deployment variables must override values in a local .env file.
+    environment_value = os.environ.get(name)
+
+    if environment_value is not None:
+        environment_value = environment_value.strip()
+        if environment_value:
+            return environment_value
+
+    # .env is a fallback for local development.
     if ENV_FILE.is_file():
         try:
             file_values = dotenv_values(dotenv_path=str(ENV_FILE))
@@ -49,24 +57,15 @@ def _read_setting(name: str, default: str = "") -> str:
                     return file_value
 
         except (OSError, UnicodeError) as exc:
-            # Do not silently hide a broken .env file.
             raise RuntimeError(
                 f"Could not read project configuration file: {ENV_FILE}"
             ) from exc
-
-    # Fallback for deployment platforms or settings absent from .env.
-    environment_value = os.environ.get(name)
-
-    if environment_value is not None:
-        environment_value = environment_value.strip()
-        if environment_value:
-            return environment_value
 
     return default.strip()
 
 
 def _token_fingerprint(token: str) -> str:
-    """Return a short identifier without exposing the token."""
+    """Return a short fingerprint without exposing the token."""
 
     if not token:
         return "missing"
@@ -91,7 +90,7 @@ def _mask_identifier(value: str) -> str:
 
 
 def _load_whatsapp_config() -> Tuple[str, str, str]:
-    """Load the latest WhatsApp configuration from .env or fallback."""
+    """Load the latest WhatsApp configuration."""
 
     phone_number_id = _read_setting("WHATSAPP_PHONE_NUMBER_ID")
     access_token = _read_setting("WHATSAPP_ACCESS_TOKEN")
@@ -112,7 +111,7 @@ def _load_whatsapp_config() -> Tuple[str, str, str]:
 # ---------------------------------------------------------
 
 def get_whatsapp_diagnostics() -> Dict[str, Any]:
-    """Return diagnostics without exposing credentials."""
+    """Return configuration diagnostics without exposing credentials."""
 
     phone_number_id, access_token, api_version = (
         _load_whatsapp_config()
@@ -128,7 +127,9 @@ def get_whatsapp_diagnostics() -> Dict[str, Any]:
         "phone_number_id_present": bool(phone_number_id),
         "phone_number_id_masked": _mask_identifier(phone_number_id),
         "api_version": api_version,
-        "config_priority": ".env first, environment fallback",
+        "config_priority": (
+            "process environment first, .env fallback"
+        ),
     }
 
 
@@ -137,9 +138,9 @@ def get_whatsapp_diagnostics() -> Dict[str, Any]:
 # ---------------------------------------------------------
 
 def send_whatsapp_message(to: str, message: str) -> Dict[str, Any]:
-    """Send a text message using the latest WhatsApp configuration."""
+    """Send a text message using the configured WhatsApp phone number."""
 
-    # Read credentials at send time, not just when this module is imported.
+    # Read settings at send time so configuration changes are picked up.
     phone_number_id, access_token, api_version = (
         _load_whatsapp_config()
     )
@@ -147,13 +148,13 @@ def send_whatsapp_message(to: str, message: str) -> Dict[str, Any]:
     if not phone_number_id:
         raise RuntimeError(
             "WHATSAPP_PHONE_NUMBER_ID is missing. "
-            f"Configure it in {ENV_FILE}."
+            "Configure it in the deployment environment or local .env."
         )
 
     if not access_token:
         raise RuntimeError(
             "WHATSAPP_ACCESS_TOKEN is missing. "
-            f"Configure it in {ENV_FILE}."
+            "Configure it in the deployment environment or local .env."
         )
 
     recipient = str(to or "").strip()
@@ -173,7 +174,7 @@ def send_whatsapp_message(to: str, message: str) -> Dict[str, Any]:
         )
 
     url = (
-        f"https://graph.facebook.com/"
+        "https://graph.facebook.com/"
         f"{api_version}/{phone_number_id}/messages"
     )
 
@@ -189,14 +190,17 @@ def send_whatsapp_message(to: str, message: str) -> Dict[str, Any]:
         "text": {"body": body},
     }
 
-    # Safe diagnostics. Never print the token or Authorization header.
+    # Safe diagnostics: never print the access token or authorization header.
     print("\n========== WHATSAPP OUTBOUND REQUEST ==========")
     print("Recipient:", _mask_identifier(recipient))
     print("Sender Phone Number ID:", _mask_identifier(phone_number_id))
     print("API version:", api_version)
     print("Token fingerprint:", _token_fingerprint(access_token))
     print("Project .env exists:", ENV_FILE.is_file())
-    print("Configuration source: .env first, environment fallback")
+    print(
+        "Configuration priority: "
+        "process environment first, .env fallback"
+    )
     print("===============================================\n")
 
     try:
@@ -260,14 +264,14 @@ def send_whatsapp_message(to: str, message: str) -> Dict[str, Any]:
 
         if response.status_code == 401 or str(code) == "190":
             print("\nAuthentication checks:")
-            print("1. Verify the .env token fingerprint.")
+            print("1. Verify the configured token fingerprint.")
             print("2. Confirm the token has not expired or been revoked.")
             print("3. Confirm the required WhatsApp permissions.")
-            print("4. Confirm access to the configured WhatsApp phone number.")
-            print("5. Confirm the .env file contains the intended token.")
+            print("4. Confirm access to the configured phone number.")
+            print("5. Confirm the intended token is configured.")
             print(
-                "6. If the fingerprint matches but Meta rejects it, "
-                "obtain a valid token from Meta."
+                "6. If Meta rejects the token, obtain a valid token "
+                "from Meta."
             )
 
         print("========================================\n")
