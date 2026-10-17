@@ -667,17 +667,17 @@ def _get_product_message(
 
             return (
 
-                "ఈ ప్రోడక్ట్ మా డెమో కాటలాగ్‌లో కనిపించలేదు. "
+                "ఈ మోడల్ మా డెమో కాటలాగ్‌లో కనిపించడం లేదు. "
 
-                "మోడల్ పేరు లేదా వేరియంట్‌ను మరింత స్పష్టంగా చెప్పగలరా? 😊"
+                "తాజా ధర, స్టాక్ వివరాలను Mania Mobiles స్టోర్‌తో నిర్ధారించి మీకు తెలియజేస్తాం. 😊"
 
             )
 
         return (
 
-            "Ee product maa demo catalog lo dorakaledu. "
+            "Ee model maa demo catalog lo kanipinchadam ledu. "
 
-            "Model peru leda variant konchem clear ga cheppagalara? 😊"
+            "Latest price mariyu stock ni Mania Mobiles store tho confirm chesi meeku cheptham. 😊"
 
         )
 
@@ -1009,12 +1009,33 @@ def _handle_saved_lead_follow_up(
 
             )
 
-    draft_reply = (
-        reply
-        + ("\n\n" if product_message else "")
-        + product_message
-    )
-    session["_return_template_reply"] = True
+    # If the requested model is not in the demo catalog, give the store-check
+    # response only. Do not prepend the generic requirements boilerplate or
+    # ask the customer to repeat a model they already specified.
+    if product_message:
+        session["catalog_message_sent"] = True
+        session["catalog_product"] = product_interest
+        follow_up = (
+            "మీ బడ్జెట్ ఎంత? ఏ స్టోరేజ్ వేరియంట్ కావాలి?"
+            if session.get("language") == "telugu"
+            else "Mee budget entha? Ye storage variant kavali?"
+        )
+        return {
+            "customer_id": customer_id,
+            "message": product_message + "\n\n" + follow_up,
+            "customer": customer,
+            "qualification": session.get("qualification"),
+            "intent": session.get("intent"),
+            "intent_history": session.get("intent_history", []),
+            "lead_id": session.get("lead_id"),
+            "lead_saved": True,
+        }
+
+    draft_reply = reply
+    # This branch builds English draft text. Do NOT mark it as a final
+    # template reply: _localize_reply must convert it to the conversation's
+    # locked language (Telugu script or Roman Telugu) before it reaches WhatsApp.
+    session.pop("_return_template_reply", None)
     return {
         "customer_id": customer_id,
         "message": _localize_reply(
@@ -1658,6 +1679,17 @@ def _localize_reply(
         catalog_context=catalog_context[:6],
 
     )
+
+    # Guard against the model returning its English boilerplate verbatim.
+    # The language is locked from the customer's first message, so use a short
+    # deterministic greeting instead of sending English to a Telugu customer.
+    response_text = str(response or "").strip()
+    boilerplate = "got it — i've updated your requirements"
+    if boilerplate in response_text.lower() or "what would you like to know about the phone" in response_text.lower():
+        if language == "telugu":
+            response = "నమస్కారం 😊 మీకు ఏ ఫోన్ గురించి వివరాలు కావాలి? మోడల్ పేరు చెప్పండి, సహాయం చేస్తాను."
+        else:
+            response = "Hi 😊 Meeku ye phone gurinchi details kavali? Model peru cheppandi, help chesthanu."
 
     # Preserve the exact product URL generated from the catalogue. The LLM may
 
