@@ -149,6 +149,8 @@ EXTRA_FIELDS = {
 
     "model",
 
+    "shopping_mode",
+
 }
 
 def _get_session(customer_id: str) -> dict:
@@ -203,9 +205,53 @@ def _get_session(customer_id: str) -> dict:
 
     return sessions[customer_id]
 
+def _is_specific_model_name(value: Any) -> bool:
+    """True when a customer has chosen an actual model, not only a brand/series."""
+    text = re.sub(r"\b\d{1,4}\s*(?:gb|tb)\b", "", str(value or ""), flags=re.I)
+    text = re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+    if not text:
+        return False
+    generic = {
+        "mobile", "mobiles", "phone", "phones", "smartphone", "android phone",
+        "iphone", "apple", "samsung", "samsung galaxy", "samsung s series",
+        "samsung a series", "samsung m series", "oneplus", "oppo", "vivo",
+        "realme", "redmi", "xiaomi", "google pixel", "pixel", "motorola",
+        "nothing", "nothing phone", "android", "any phone", "any mobile",
+    }
+    if text in generic or re.fullmatch(r"(?:samsung )?(?:galaxy )?[samz] series", text):
+        return False
+    # Most consumer phone models contain a model number (iPhone 15, Galaxy A55,
+    # Pixel 9, Redmi Note 13, OnePlus Nord 4, etc.).
+    if re.search(r"\d{1,3}", text):
+        return True
+    # Recognize named product variants which do not always use a simple number.
+    return bool(re.search(r"\b(airpods pro|airpods max|iphone se)\b", text))
+
+
+def _is_brand_only(value: Any) -> bool:
+    text = re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+    return text in {
+        "samsung", "apple", "iphone", "oneplus", "oppo", "vivo", "realme",
+        "redmi", "xiaomi", "google pixel", "pixel", "motorola", "nothing",
+        "samsung galaxy", "samsung s series", "samsung a series", "samsung m series",
+    }
+
+
 def _field_is_complete(field: str, customer: dict) -> bool:
 
     value = customer.get(field)
+
+    # A brand by itself is not an exact phone variant. Keep asking for the model
+    # until the customer chooses one, unless they explicitly want recommendations.
+    if field == "product_interest":
+        if customer.get("shopping_mode") == "recommendation":
+            return True
+        return _is_specific_model_name(customer.get("model") or value)
+
+    if field == "storage":
+        if customer.get("shopping_mode") == "recommendation" and not value:
+            return True
+        return bool(str(value or "").strip())
 
     if field == "budget":
 
@@ -1920,11 +1966,110 @@ def _apply_deterministic_customer_updates(message: str, extracted: dict, custome
 
     compact = re.sub(r"[^a-z0-9₹]+", "", text)
 
-    # Capture storage variants locally, even when the LLM extractor misses them.
-    # Examples: 128GB, 256 gb, 1TB.
+    # Detect an explicit request for recommendations separately from a customer
+    # who has selected a brand and must still choose an exact model.
+    recommendation_patterns = (
+        r"\b(best phone|best mobile|suggest|recommend|recommendation|which phone|which mobile|options compare|compare phones|manchi phone suggest|manchi mobile suggest)\b",
+        r"ఏ ఫోన్ మంచిది|మంచి ఫోన్ సూచించ|మోడల్స్ పోల్చి",
+    )
+    if any(re.search(pattern, text, re.I) for pattern in recommendation_patterns):
+        result["shopping_mode"] = "recommendation"
+
+    # Deterministically capture common brands and exact models. This prevents an
+    # LLM call for simple messages such as "Samsung mobile kavali" or
+    # "iPhone 15 128GB kavali". Brand-only choices remain incomplete until the
+    # exact model is selected.
+    model_patterns = [
+        (r"\biphone\s*(\d{1,2})(?:\s*(pro\s*max|pro|max|plus|mini|e))?", "iPhone"),
+        (r"ఐఫోన్\s*(\d{1,2})(?:\s*(ప్రో\s*మ్యాక్స్|ప్రో|ప్లస్|మినీ))?", "iPhone"),
+        (r"\b(?:samsung\s*)?(?:galaxy\s*)?([samz]\s*\d{1,3})(?:\s*(ultra|plus|fe|classic|edge))?", "Samsung Galaxy"),
+        (r"(?:^|\s)(?:సామ్‌సంగ్\s*)?(?:గెలాక్సీ\s*)?([samz]\s*\d{1,3})(?:\s*(ultra|plus|fe))?", "Samsung Galaxy"),
+        (r"\b(?:samsung\s+)?galaxy\s+([a-z]\d{1,3})(?:\s*(ultra|plus|fe))?", "Samsung Galaxy"),
+        (r"\b(oneplus\s+(?:nord\s+)?\d{1,2}(?:r|t|pro|rce)?(?:\s*(?:pro|plus|ce))?)", "OnePlus"),
+        (r"\b(redmi\s+note\s+\d{1,2}(?:\s*(?:pro|plus|pro plus))?)", "Redmi"),
+        (r"\b(redmi\s+\d{1,2}(?:\s*(?:a|c|pro))?)", "Redmi"),
+        (r"\b(realme\s+\d{1,2}(?:\s*(?:pro|plus|pro plus|x))?)", "realme"),
+        (r"\b(oppo\s+(?:reno\s*)?\d{1,2}(?:\s*(?:pro|plus|f|a))?)", "OPPO"),
+        (r"\b(vivo\s+(?:v|y|x|t)\s*\d{1,3}(?:\s*(?:pro|plus|e))?)", "vivo"),
+        (r"\b(?:google\s*)?pixel\s*(\d{1,2})(?:\s*(pro|xl|a|fold))?", "Google Pixel"),
+        (r"\b(motorola\s+edge\s+\d{1,2}(?:\s*(?:ultra|neo|fusion))?)", "Motorola"),
+        (r"\b(nothing\s+phone\s*\d{1,2}(?:\s*(?:a|plus))?)", "Nothing Phone"),
+    ]
+    model_found = False
+    for pattern, prefix in model_patterns:
+        match = re.search(pattern, text, re.I)
+        if not match:
+            continue
+        matched = re.sub(r"\s+", " ", match.group(0)).strip()
+        # Normalize common model family names while preserving model suffixes.
+        if prefix == "iPhone":
+            tail = re.sub(r"^iphone\s*", "", matched, flags=re.I)
+            result["product_interest"] = f"iPhone {tail}".strip()
+            result["brand"] = "Apple"
+        elif prefix == "Samsung Galaxy":
+            tail = re.sub(r"^(?:samsung\s*)?(?:galaxy\s*)?", "", matched, flags=re.I).strip()
+            code_match = re.match(r"^([a-z])\s*(\d+)(.*)$", tail, re.I)
+            if code_match:
+                suffix = " ".join(part.title() for part in code_match.group(3).split())
+                tail = f"{code_match.group(1).upper()}{code_match.group(2)}" + (f" {suffix}" if suffix else "")
+            result["product_interest"] = f"Samsung Galaxy {tail}".strip()
+            result["brand"] = "Samsung"
+        elif prefix == "Google Pixel":
+            tail = re.sub(r"^(?:google\s*)?pixel\s*", "", matched, flags=re.I)
+            result["product_interest"] = f"Google Pixel {tail}".strip()
+            result["brand"] = "Google"
+        else:
+            result["product_interest"] = matched[:1].upper() + matched[1:]
+            result["brand"] = prefix
+        result["model"] = result["product_interest"]
+        result["shopping_mode"] = "specific"
+        model_found = True
+        break
+
+    if not model_found:
+        brand_patterns = [
+            (r"\b(samsung)(?:\s+(?:mobile|phone|galaxy))?\b|సామ్‌సంగ్", "Samsung"),
+            (r"\b(iphone|apple)(?:\s+(?:mobile|phone))?\b|ఐఫోన్|ఆపిల్", "Apple"),
+            (r"\b(oneplus|oppo|vivo|realme|redmi|xiaomi|motorola|nothing)(?:\s+(?:mobile|phone))?\b|వన్‌ప్లస్|ఒప్పో|వివో|రియల్‌మి|రెడ్‌మి|మోటరోలా|నథింగ్", None),
+            (r"\bgoogle\s+pixel\b|గూగుల్ పిక్సెల్", "Google"),
+        ]
+        for pattern, fixed_brand in brand_patterns:
+            match = re.search(pattern, text, re.I)
+            if match:
+                captured_brand = match.group(1) if match.lastindex else None
+                if fixed_brand:
+                    brand = fixed_brand
+                elif captured_brand:
+                    brand = captured_brand.title()
+                elif "వన్‌ప్లస్" in text:
+                    brand = "OnePlus"
+                elif "ఒప్పో" in text:
+                    brand = "OPPO"
+                elif "వివో" in text:
+                    brand = "Vivo"
+                elif "రియల్‌మి" in text:
+                    brand = "Realme"
+                elif "రెడ్‌మి" in text:
+                    brand = "Redmi"
+                elif "మోటరోలా" in text:
+                    brand = "Motorola"
+                else:
+                    brand = "Nothing"
+                result.setdefault("brand", brand)
+                if not result.get("product_interest") or _is_brand_only(result.get("product_interest")):
+                    result["product_interest"] = brand if brand != "Apple" else "iPhone"
+                if result.get("shopping_mode") != "recommendation":
+                    result["shopping_mode"] = "specific"
+                break
+
+    # Capture storage variants locally, including short contextual replies such as "128 kavali".
     storage_match = re.search(r"\b(\d{1,4})\s*(gb|tb)\b", text, re.I)
     if storage_match:
         result["storage"] = f"{storage_match.group(1)}{storage_match.group(2).upper()}"
+    elif (asked_field == "storage" or (customer.get("product_interest") or result.get("product_interest")) and not customer.get("storage")):
+        bare_storage = re.search(r"(?<!\d)(64|128|256|512)\s*(?:gb)?(?:\s*(?:kavali|kavala|kaavali|variant|storage|want|please|saripothundi))?\b", text, re.I)
+        if bare_storage:
+            result["storage"] = f"{bare_storage.group(1)}GB"
 
     # Timeline: explicitly map short answers such as "Tarwatha" and
     # "compare chesi confirm chestha" to a completed timeline field.
@@ -1939,6 +2084,9 @@ def _apply_deterministic_customer_updates(message: str, extracted: dict, custome
         (r"\b(tarvatha|tarwatha|tarvata|taruvatha|later|not now|after some time|sometime later)\b", "later"),
 
         (r"\b(compare chesi|compare che(si|si)|compare chestha|compare chesi confirm|decide chesaka|confirm chesaka|think and decide|after comparing|comparing options|compare first|just comparing|only comparing|just browsing|just checking|just looking)\b", "later"),
+        (r"ఈరోజు|ఇవాళ|ఇప్పుడే", "today"),
+        (r"ఈ వారం|ఈ వారంలో|వారంలోపు", "within a week"),
+        (r"తర్వాత|తరువాత|వచ్చే వారం|వచ్చే నెల|కొన్ని వారాల తర్వాత", "later"),
 
     ]
 
@@ -1971,19 +2119,15 @@ def _apply_deterministic_customer_updates(message: str, extracted: dict, custome
     # explicitly asked for the customer's city/town.
 
     if (
-
         asked_field == "location"
-
         and not result.get("location")
-
         and not customer.get("location")
-
-        and re.fullmatch(r"[A-Za-z][A-Za-z .'-]{1,49}", (message or "").strip())
-
-        and not re.search(r"\b(cash|card|upi|emi|yes|no|okay|fine|later|today|tomorrow)\b", text)
-
+        and (
+            re.fullmatch(r"[A-Za-z][A-Za-z .'-]{1,49}", (message or "").strip())
+            or re.fullmatch(r"[\u0c00-\u0c7f\s]{2,40}", (message or "").strip())
+        )
+        and not re.search(r"\b(cash|card|upi|emi|yes|no|okay|fine|later|today|tomorrow)\b|అవును|కాదు|తర్వాత|ఈరోజు", text)
     ):
-
         result["location"] = message.strip()
 
     # Condition / new-vs-used.
@@ -2033,7 +2177,7 @@ def _apply_deterministic_customer_updates(message: str, extracted: dict, custome
     )
     budget_context = bool(
         asked_field == "budget"
-        or re.search(r"\b(budget|under|below|around|approximately|approx|rupees|rs)\b|₹", text)
+        or re.search(r"\b(budget|under|below|around|approximately|approx|rupees|rs|lopu|varaku|ma budget|naa budget)\b|₹", text)
     )
     # Number before the word "budget" is common in Roman Telugu: "82000 ma budget".
     number_match = re.search(
@@ -2085,7 +2229,11 @@ def _localized_question(field: str, language: str, customer: dict) -> str:
 
         templates = {
 
-            "product_interest": "మానియా మొబైల్స్‌కు స్వాగతం 😊 మీకు ఏ మొబైల్ కావాలి? బ్రాండ్, మోడల్ పేరు చెప్పండి.",
+            "product_interest": (
+                f"{('మీరు ' + str(customer.get('storage')) + ' స్టోరేజ్ కావాలని చెప్పారు. ') if customer.get('storage') else ''}మీరు {customer.get('brand') or product} అన్నారు 😊 ఆ బ్రాండ్‌లో ఖచ్చితమైన మోడల్ ఏది? ఉదాహరణకు Galaxy A55 లేదా S24. మోడల్ నిర్ణయించకపోతే మీ అవసరానికి సరిపోయే ఆప్షన్లు సూచించగలను."
+                if (customer.get("brand") or product) and not _is_specific_model_name(customer.get("product_interest")) and customer.get("shopping_mode") != "recommendation"
+                else "మానియా మొబైల్స్‌కు స్వాగతం 😊 మీకు ఏ మొబైల్ కావాలి? బ్రాండ్, మోడల్ పేరు చెప్పండి."
+            ),
 
             "storage": f"{product}లో ఏ స్టోరేజ్ వేరియంట్ కావాలి—128GB, 256GB, లేక 512GB?" if product else "ఏ స్టోరేజ్ వేరియంట్ కావాలి—128GB, 256GB, లేక 512GB?",
 
@@ -2105,7 +2253,11 @@ def _localized_question(field: str, language: str, customer: dict) -> str:
 
         templates = {
 
-            "product_interest": "Mania Mobiles ki welcome 😊 Meeku ye mobile kavali? Brand mariyu model peru cheppandi.",
+            "product_interest": (
+                f"{('Meeru ' + str(customer.get('storage')) + ' storage kavali ani chepparu. ') if customer.get('storage') else ''}Meeru {customer.get('brand') or product} annaru bro 😊 Aa brand lo exact model enti? Example: Galaxy A55 leka S24. Model decide cheyyakapothe mee budget/use ki set ayye options suggest chestha."
+                if (customer.get("brand") or product) and not _is_specific_model_name(customer.get("product_interest")) and customer.get("shopping_mode") != "recommendation"
+                else "Mania Mobiles ki welcome 😊 Meeku ye mobile kavali? Brand mariyu model peru cheppandi."
+            ),
 
             "storage": f"{product} lo ye storage variant kavali—128GB, 256GB, leka 512GB?" if product else "Ye storage variant kavali—128GB, 256GB, leka 512GB?",
 
@@ -2209,22 +2361,46 @@ def _process_message_impl(
 
     print("Active conversation language:", active_language)
 
-    # Extract details even after a lead is saved,
-
-    # so corrections and follow-up information
-
-    # can still be understood.
-
+    # Deterministic rules handle common short answers and contextual objections
+    # without an LLM call. Only genuinely ambiguous business messages reach the
+    # configured extractor. Out-of-scope messages are rejected earlier by the
+    # local scope gate in _process_message_serialized.
+    asked_field_before_turn = session.get("asked_field", "")
+    repair_message = _is_context_repair_message(message) and _has_business_context(session)
+    payment_objection = (
+        asked_field_before_turn == "payment_method"
+        and _is_payment_objection(message)
+        and _has_business_context(session)
+    )
+    deterministic = _apply_deterministic_customer_updates(
+        message=message, extracted={}, customer=customer, asked_field=asked_field_before_turn
+    )
+    simple_deterministic_turn = bool(deterministic) and not re.search(
+        r"\b(price|how much|cost|available|in stock|compare|difference|feature|specification|warranty|discount|offer|suggest|recommend|best phone|best mobile|which phone|which mobile)\b|ధర ఎంత|ఎంత ధర|తేడా ఏంటి|మంచి ఫోన్ సూచించ|ఏ ఫోన్ మంచిది",
+        message.lower(),
+    )
     try:
-
-        extracted = extract_customer_details(
-
-            message,
-
-            customer,
-
-        )
-
+        if repair_message:
+            extracted = {}
+            print("LLM extraction skipped: contextual repair message")
+        elif payment_objection:
+            extracted = {"payment_method": "not specified"}
+            session["_qualification_ack"] = (
+                "పర్లేదు 😊 పేమెంట్ విధానం చెప్పడం తప్పనిసరి కాదు. "
+                if active_language == "telugu"
+                else "Parledhu bro 😊 Payment method cheppadam compulsory kaadu. "
+            )
+            print("LLM extraction skipped: optional payment objection")
+        elif simple_deterministic_turn:
+            extracted = deterministic
+            print("LLM extraction skipped: deterministic customer details")
+        else:
+            extracted = extract_customer_details(message, customer)
+            if not isinstance(extracted, dict):
+                extracted = {}
+            extracted = _apply_deterministic_customer_updates(
+                message=message, extracted=extracted, customer=customer, asked_field=asked_field_before_turn
+            )
     except Exception as exc:
 
         print("Customer detail extraction failed:", type(exc).__name__)
@@ -2289,17 +2465,11 @@ def _process_message_impl(
 
         extracted = {}
 
-    extracted = _apply_deterministic_customer_updates(
-
-        message=message,
-
-        extracted=extracted,
-
-        customer=customer,
-
-        asked_field=session.get("asked_field", ""),
-
-    )
+    if not simple_deterministic_turn and not repair_message and not payment_objection:
+        extracted = _apply_deterministic_customer_updates(
+            message=message, extracted=extracted, customer=customer,
+            asked_field=session.get("asked_field", "")
+        )
 
     # Merge required and additional
 
@@ -2391,6 +2561,15 @@ def _process_message_impl(
 
     )
 
+    if repair_message:
+        repair_reply = _context_repair_reply(active_language, customer, session)
+        return {
+            "customer_id": customer_id, "message": repair_reply, "customer": customer,
+            "qualification": session.get("qualification"), "intent": session.get("intent"),
+            "intent_history": session.get("intent_history", []), "lead_id": session.get("lead_id"),
+            "lead_saved": bool(session.get("lead_saved")),
+        }
+
     # ---------------------------------------------------------
 
     # EXISTING LEAD
@@ -2474,6 +2653,7 @@ def _process_message_impl(
     variant_is_complete = bool(current_product and current_storage)
     should_lookup_variant = (
         variant_is_complete
+        and _is_specific_model_name(current_product)
         and (product_named_now or variant_supplied_now)
         and str(session.get("catalog_product") or "").strip().lower() != variant_key.lower()
     )
@@ -2569,6 +2749,10 @@ def _process_message_impl(
         # "Thanks! I've recorded..."
 
         message_parts = []
+
+        acknowledgement = session.pop("_qualification_ack", "")
+        if acknowledgement:
+            message_parts.append(acknowledgement.strip())
 
         if product_message:
 
@@ -3209,7 +3393,96 @@ def _is_clear_intent_response(message: str) -> bool:
     )
     if any(phrase in text for phrase in positive_phrases):
         return True
-    return _negative_intent(message) < 0
+    negative_phrases = (
+        "not interested", "don't want to buy", "do not want to buy",
+        "not buying now", "not planning to buy", "no plan to buy",
+        "i won't buy", "i will not buy", "not now", "maybe later",
+        "konanu", "konalani ledu", "konadaniki plan ledu", "ippudu konanu",
+        "interest ledu", "ఇప్పుడు కొనను", "కొనాలని లేదు", "ఆసక్తి లేదు",
+    )
+    return any(phrase in text for phrase in negative_phrases)
+
+
+def _is_context_repair_message(message: str) -> bool:
+    text = re.sub(r"\s+", " ", (message or "").strip().lower())
+    phrases = (
+        "what mobile did i ask", "which mobile did i ask", "what phone did i ask",
+        "i already told", "already told you", "i said that already",
+        "you are not understanding", "you don't understand", "not what i asked",
+        "worst replies", "what are you answering", "what did i ask",
+        "asalu nenu adugutundhi", "asalu nenu adigedi", "nv cheptundhi yenti",
+        "nuvvu cheptundi enti", "cheppa kadha", "cheppa kada", "already cheppa",
+        "nen ye mobile adigano", "nenu ye mobile adigano", "nen inka ye mobile",
+        "nenu inka ye mobile", "nen inkaa ye mobile", "nenu inkaa ye mobile",
+        "nen ye phone adigano", "ye mobile oo cheppaledhu", "ye mobile cheppaledhu",
+        "నేను ఏ మొబైల్ అడిగానో", "నేను చెప్పాను కదా", "మీరు ఏం చెప్తున్నారు",
+        "అది నేను అడగలేదు", "నేను ఇంకా ఏ మొబైల్",
+    )
+    return any(phrase in text for phrase in phrases)
+
+
+def _is_payment_objection(message: str) -> bool:
+    text = re.sub(r"\s+", " ", (message or "").strip().lower())
+    patterns = (
+        r"\bwhy (do you|would you|should you) (need|care|ask)",
+        r"\bwhy does it matter\b", r"\bnone of your business\b",
+        r"\byenduku\b.*\b(neeku|meeku)\b",
+        r"\b(neeku|meeku) yenduku\b", r"\bpayment.*yenduku\b",
+        r"\bnenu payment.*yela chesthe.*yenduku\b",
+        r"\bcompulsory kaadu kada\b", r"\bwhy are you asking about payment\b",
+        r"పేమెంట్.*ఎందుకు", r"నేను ఎలా చెల్లిస్తే మీకెందుకు",
+    )
+    return any(re.search(pattern, text, re.I) for pattern in patterns)
+
+
+def _has_business_context(session: dict) -> bool:
+    customer = session.get("customer") or {}
+    if any(customer.get(key) for key in ("product_interest", "brand", "storage", "budget", "use_case")):
+        return True
+    history = session.get("conversation_history") or []
+    return any(
+        isinstance(item, dict) and item.get("sender_type") == "assistant"
+        and any(word in str(item.get("message") or "").lower() for word in ("mobile", "phone", "మొబైల్", "ఫోన్", "variant", "storage"))
+        for item in history[-8:]
+    )
+
+
+def _context_repair_reply(language: str, customer: dict, session: dict) -> str:
+    """Answer context/complaint messages without calling an LLM."""
+    product = str(customer.get("model") or customer.get("product_interest") or "").strip()
+    brand = str(customer.get("brand") or "").strip()
+    storage = str(customer.get("storage") or "").strip()
+    budget = customer.get("budget")
+    budget_text = _format_budget(budget) if budget else ""
+
+    if language == "telugu":
+        if product or brand:
+            details = product if _is_specific_model_name(product) else (brand or product)
+            if storage:
+                details += f", {storage}"
+            if budget_text:
+                details += f", బడ్జెట్ {budget_text}"
+            if not _is_specific_model_name(product):
+                return f"క్షమించండి 😊 మీరు {details} అని చెప్పారు. బ్రాండ్/స్టోరేజ్ అర్థమైంది, కానీ ఖచ్చితమైన మోడల్ ఇంకా ఎంచుకోలేదు. ఏ మోడల్ కావాలి? తెలియకపోతే మీ బడ్జెట్‌కు సరిపోయే మోడల్స్ సూచిస్తాను."
+            next_field = next((field for field in FIELD_ORDER if not _field_is_complete(field, customer)), None)
+            if next_field:
+                return f"క్షమించండి 😊 మీరు {details} అని చెప్పారు; ఆ వివరాలు గుర్తున్నాయి. " + _localized_question(next_field, language, customer)
+            return f"క్షమించండి 😊 మీరు {details} గురించి అడుగుతున్నారు. ధర/స్టాక్‌ను నిర్ధారించి సహాయం చేస్తాను."
+        return "క్షమించండి 😊 మీ మాటను సరిగా అర్థం చేసుకోలేదు. ఏ మొబైల్ మోడల్ గురించి మాట్లాడుతున్నామో చెప్పండి; మిగతా వివరాలు మళ్లీ అడిగి ఇబ్బంది పెట్టను."
+
+    if product or brand:
+        details = product if _is_specific_model_name(product) else (brand or product)
+        if storage:
+            details += f", {storage}"
+        if budget_text:
+            details += f", budget {budget_text}"
+        if not _is_specific_model_name(product):
+            return f"Sorry bro 😊 Meeru {details} ani chepparu. Brand/storage ardham ayyayi, kani exact model inka select cheyyaledu. Ye model kavali? Teliyakapotey mee budget ki set ayye models suggest chestha."
+        next_field = next((field for field in FIELD_ORDER if not _field_is_complete(field, customer)), None)
+        if next_field:
+            return f"Sorry bro 😊 Meeru {details} ani chepparu; aa details gurthunnayi. " + _localized_question(next_field, language, customer)
+        return f"Sorry bro 😊 Meeru {details} gurinchi adugutunnaru. Price/stock verify chesi help chestha."
+    return "Sorry bro 😊 Mee message ni context tho sarigga connect cheyyaledu. Ye mobile model gurinchi matladuthunnamo cheppandi; details malli malli adaganu."
 
 
 def _is_valid_answer_for_current_field(message: str, session: dict) -> bool:
@@ -3220,20 +3493,29 @@ def _is_valid_answer_for_current_field(message: str, session: dict) -> bool:
         return False
     if session.get("intent_question_asked") and _is_clear_intent_response(message):
         return True
+    if field == "payment_method" and _is_payment_objection(message):
+        return True
+    if _is_context_repair_message(message) and _has_business_context(session):
+        return True
     if field == "budget" and re.search(r"\d", text):
         return True
-    if field == "storage" and re.search(r"\b\d{1,4}\s*(?:gb|tb)\b", text):
+    if re.search(r"\b\d{1,4}\s*(?:gb|tb)\b", text):
+        return True
+    if (field == "storage" or ((session.get("customer") or {}).get("product_interest") or (session.get("customer") or {}).get("brand"))) and re.search(r"(?<!\d)(64|128|256|512)\s*(?:gb)?(?:\s*(?:kavali|kavala|kaavali|variant|storage|want|please))?\b", text):
         return True
     if field == "purchase_timeline" and re.search(
-        r"\b(today|tomorrow|tonight|this week|next week|this month|next month|later|within|week|month|ivala|eeroju|repu|tarvatha|tarwatha)\b|\u0c30\u0c47\u0c2a\u0c41|\u0c08 \u0c35\u0c3e\u0c30\u0c02",
+        r"\b(today|tomorrow|tonight|this week|next week|this month|next month|later|within|week|month|ivala|eeroju|repu|tarvatha|tarwatha)\b|రేపు|తర్వాత|తరువాత|ఈరోజు|ఇవాళ|ఈ వారం|వచ్చే వారం|\u0c30\u0c47\u0c2a\u0c41|\u0c08 \u0c35\u0c3e\u0c30\u0c02",
         text,
     ):
         return True
-    if field == "condition" and re.search(r"\b(new|brand new|sealed|used|second hand|refurbished|kotha|kottha)\b|\u0c15\u0c4a\u0c24\u0c4d\u0c24|\u0c35\u0c3e\u0c21\u0c3f\u0c28", text):
+    if field == "condition" and re.search(r"\b(new|brand new|sealed|used|second hand|refurbished|kotha|kottha)\b|కొత్త|సీల్డ్|వాడిన|రిఫర్బిష్డ్|\u0c15\u0c4a\u0c24\u0c4d\u0c24|\u0c35\u0c3e\u0c21\u0c3f\u0c28", text):
         return True
-    if field == "payment_method" and re.search(r"\b(cash|card|upi|gpay|phonepe|paytm|emi|yes|any)\b", text):
+    if field == "payment_method" and re.search(r"\b(cash|card|upi|gpay|phonepe|paytm|emi|yes|any)\b|నగదు|కార్డు|కార్డ్|యూపీఐ|ఈఎంఐ", text):
         return True
-    if field == "location" and len(text.split()) <= 3 and re.fullmatch(r"[a-zA-Z][a-zA-Z .'-]{1,49}", message.strip()):
+    if field == "location" and len(text.split()) <= 3 and (
+        re.fullmatch(r"[a-zA-Z][a-zA-Z .'-]{1,49}", message.strip())
+        or re.fullmatch(r"[\u0c00-\u0c7f\s]{2,40}", message.strip())
+    ):
         return True
     if field == "product_interest" and re.search(r"\b(iphone|samsung|oneplus|oppo|vivo|realme|redmi|xiaomi|google pixel|motorola|nothing|mobile|phone)\b|\b[a-z]+\s*\d{1,3}\b", text):
         return True
@@ -3258,6 +3540,10 @@ def _is_business_related_message(message: str, session: dict) -> bool:
     if re.fullmatch(r"(how are you|what are you doing|tell me something|who are you|what is your name)[?.! ]*", text):
         return False
     if _is_valid_answer_for_current_field(message, session):
+        return True
+    if _has_business_context(session) and _is_context_repair_message(message):
+        return True
+    if session.get("asked_field") == "payment_method" and _has_business_context(session) and _is_payment_objection(message):
         return True
 
     business_terms = (
