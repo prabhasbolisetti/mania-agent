@@ -95,19 +95,28 @@ INTENT_QUESTION = (
 )
 
 FIELD_ORDER = [
-
+    # Ask one missing qualification field at a time. Storage is required because
+    # price and catalogue matching can differ substantially by variant.
     "product_interest",
-
+    "storage",
     "budget",
-
     "purchase_timeline",
-
     "condition",
-
     "payment_method",
-
     "location",
+]
 
+# Preserve the historical restore contract used by existing saved sessions:
+# restore the six core qualification fields in their original order. Storage
+# is still required during the live flow (FIELD_ORDER), but it must not change
+# the expected asked_field when recovering a legacy session.
+RESTORE_FIELD_ORDER = [
+    "product_interest",
+    "budget",
+    "purchase_timeline",
+    "condition",
+    "payment_method",
+    "location",
 ]
 
 # Additional details that must be preserved in the lead record.
@@ -559,6 +568,40 @@ def _is_specific_product_mentioned(message: str, product_interest: str = "") -> 
 
     return bool(product_tokens and any(token in message_tokens for token in product_tokens))
 
+def _catalog_variant_matches(requested_variant: str, catalog_name: str) -> bool:
+    """Avoid sending a nearby but wrong model (for example Pro vs base model)."""
+    requested = re.sub(r"[^a-z0-9]+", " ", (requested_variant or "").lower()).strip()
+    candidate_raw = (catalog_name or "").lower()
+    candidate = re.sub(r"[^a-z0-9]+", " ", candidate_raw).strip()
+    if not requested or not candidate:
+        return False
+
+    requested_storage = re.search(r"\b(\d{1,4})\s*(gb|tb)\b", requested_variant or "", re.I)
+    candidate_storage = re.search(r"\b(\d{1,4})\s*(gb|tb)\b", catalog_name or "", re.I)
+    if requested_storage and (
+        not candidate_storage
+        or requested_storage.group(1) != candidate_storage.group(1)
+        or requested_storage.group(2).lower() != candidate_storage.group(2).lower()
+    ):
+        return False
+
+    # Require every meaningful requested model token, but permit a catalogue brand prefix.
+    ignored = {"apple", "samsung", "mobile", "phone", "smartphone", "the", "with"}
+    requested_tokens = [
+        token for token in requested.split()
+        if token not in ignored and not re.fullmatch(r"\d{1,4}(?:gb|tb)", token)
+    ]
+    if not requested_tokens or not all(token in candidate.split() for token in requested_tokens):
+        return False
+
+    modifiers = {"pro", "max", "plus", "mini", "ultra", "air", "fold", "flip", "fe"}
+    requested_modifiers = modifiers.intersection(requested.split())
+    candidate_modifiers = modifiers.intersection(candidate.split())
+    if candidate_modifiers - requested_modifiers:
+        return False
+    return True
+
+
 def _get_product_message(
 
     product_interest: str,
@@ -592,17 +635,11 @@ def _get_product_message(
         matches = _search_catalog(product_interest)
 
         matches = [
-
             item for item in matches
-
-            if _is_specific_product_mentioned(
-
-                customer_message,
-
+            if _catalog_variant_matches(
+                product_interest,
                 str(item.get("product_name") or item.get("model") or ""),
-
             )
-
         ]
 
         if matches:
@@ -1883,10 +1920,14 @@ def _apply_deterministic_customer_updates(message: str, extracted: dict, custome
 
     compact = re.sub(r"[^a-z0-9₹]+", "", text)
 
+    # Capture storage variants locally, even when the LLM extractor misses them.
+    # Examples: 128GB, 256 gb, 1TB.
+    storage_match = re.search(r"\b(\d{1,4})\s*(gb|tb)\b", text, re.I)
+    if storage_match:
+        result["storage"] = f"{storage_match.group(1)}{storage_match.group(2).upper()}"
+
     # Timeline: explicitly map short answers such as "Tarwatha" and
-
     # "compare chesi confirm chestha" to a completed timeline field.
-
     timeline_patterns = [
 
         (r"\b(ivala|eeroju|today|right now|immediately|ippude)\b", "today"),
@@ -1897,7 +1938,7 @@ def _apply_deterministic_customer_updates(message: str, extracted: dict, custome
 
         (r"\b(tarvatha|tarwatha|tarvata|taruvatha|later|not now|after some time|sometime later)\b", "later"),
 
-        (r"\b(compare chesi|compare che(si|si)|compare chestha|compare chesi confirm|decide chesaka|confirm chesaka|think and decide|after comparing|comparing options|compare first)\b", "later"),
+        (r"\b(compare chesi|compare che(si|si)|compare chestha|compare chesi confirm|decide chesaka|confirm chesaka|think and decide|after comparing|comparing options|compare first|just comparing|only comparing|just browsing|just checking|just looking)\b", "later"),
 
     ]
 
@@ -1983,67 +2024,44 @@ def _apply_deterministic_customer_updates(message: str, extracted: dict, custome
 
         result["payment_method"] = "any"
 
-    # Numeric budget ranges. Keep this conservative; the LLM handles more complex
+    # Numeric budget ranges and single amounts. Accept natural variants such as
+    # "40k-60k", "40,000 to 60,000", "45k", "82000 ma budget", or "82000"
+    # when the agent is currently asking for the budget.
+    range_match = re.search(
+        r"(?:₹\s*)?(\d+(?:,\d{3})*(?:\.\d+)?)\s*([kK]?)\s*(?:-|–|to|and|nunchi)\s*(?:₹\s*)?(\d+(?:,\d{3})*(?:\.\d+)?)\s*([kK]?)",
+        text,
+    )
+    budget_context = bool(
+        asked_field == "budget"
+        or re.search(r"\b(budget|under|below|around|approximately|approx|rupees|rs)\b|₹", text)
+    )
+    # Number before the word "budget" is common in Roman Telugu: "82000 ma budget".
+    number_match = re.search(
+        r"(?:₹\s*)?(\d+(?:,\d{3})*(?:\.\d+)?)\s*([kK]?)",
+        text,
+    ) if budget_context else None
 
-    # expressions. Examples: "40k-60k", "40,000 to 60,000", "45k".
+    def amount(number, suffix):
+        number = float(number.replace(",", ""))
+        if suffix.lower() == "k" or number < 1000:
+            number *= 1000
+        return int(number)
 
-    if not result.get("budget"):
-
-        range_match = re.search(
-
-            r"(?:₹\s*)?(\d+(?:,\d{3})*(?:\.\d+)?)\s*([kK]?)\s*(?:-|–|to|and|nunchi)\s*(?:₹\s*)?(\d+(?:,\d{3})*(?:\.\d+)?)\s*([kK]?)",
-
-            text,
-
-        )
-
-        single_match = re.search(
-
-            r"(?:budget|under|below|around|approx(?:imately)?|₹)\s*(?:₹\s*)?(\d+(?:,\d{3})*(?:\.\d+)?)\s*([kK]?)",
-
-            text,
-
-        )
-
-        def amount(number, suffix):
-
-            number = float(number.replace(",", ""))
-
-            if suffix.lower() == "k" or number < 1000:
-
-                number *= 1000
-
-            return int(number)
-
-        try:
-
-            if range_match:
-
-                low = amount(range_match.group(1), range_match.group(2))
-
-                high = amount(range_match.group(3), range_match.group(4))
-
-                if 1000 <= low <= high <= 10000000:
-
-                    result["budget"] = {"min": low, "max": high}
-
-                    result["budget_min"] = low
-
-                    result["budget_max"] = high
-
-            elif single_match:
-
-                value = amount(single_match.group(1), single_match.group(2))
-
-                if 1000 <= value <= 10000000:
-
-                    result["budget"] = value
-
-                    result["budget_amount"] = value
-
-        except (TypeError, ValueError):
-
-            pass
+    try:
+        if range_match:
+            low = amount(range_match.group(1), range_match.group(2))
+            high = amount(range_match.group(3), range_match.group(4))
+            if 1000 <= low <= high <= 10000000:
+                result["budget"] = {"min": low, "max": high}
+                result["budget_min"] = low
+                result["budget_max"] = high
+        elif number_match and budget_context and not result.get("budget"):
+            value = amount(number_match.group(1), number_match.group(2))
+            if 1000 <= value <= 10000000:
+                result["budget"] = value
+                result["budget_amount"] = value
+    except (TypeError, ValueError):
+        pass
 
     return result
 
@@ -2069,6 +2087,8 @@ def _localized_question(field: str, language: str, customer: dict) -> str:
 
             "product_interest": "మానియా మొబైల్స్‌కు స్వాగతం 😊 మీకు ఏ మొబైల్ కావాలి? బ్రాండ్, మోడల్ పేరు చెప్పండి.",
 
+            "storage": f"{product}లో ఏ స్టోరేజ్ వేరియంట్ కావాలి—128GB, 256GB, లేక 512GB?" if product else "ఏ స్టోరేజ్ వేరియంట్ కావాలి—128GB, 256GB, లేక 512GB?",
+
             "budget": f"{product} కోసం సుమారుగా ఎంత బడ్జెట్ అనుకుంటున్నారు?" if product else "మీ బడ్జెట్ ఎంత అనుకుంటున్నారు?",
 
             "purchase_timeline": "ఎప్పుడు కొనాలని ప్లాన్ చేస్తున్నారు—ఈరోజు, ఈ వారం, లేక తర్వాత?",
@@ -2086,6 +2106,8 @@ def _localized_question(field: str, language: str, customer: dict) -> str:
         templates = {
 
             "product_interest": "Mania Mobiles ki welcome 😊 Meeku ye mobile kavali? Brand mariyu model peru cheppandi.",
+
+            "storage": f"{product} lo ye storage variant kavali—128GB, 256GB, leka 512GB?" if product else "Ye storage variant kavali—128GB, 256GB, leka 512GB?",
 
             "budget": f"{product} kosam roughly entha budget anukuntunnaru?" if product else "Mee budget entha anukuntunnaru?",
 
@@ -2343,6 +2365,18 @@ def _process_message_impl(
 
         }
 
+    # The scorer's phrase list may not include a bare "no". If this turn answers
+    # the final buying-intent question negatively, apply that explicit signal here.
+    if session.get("intent_question_asked") and message.strip().lower() in {"no", "nope", "not now"}:
+        intent["score"] = max(0, int(intent.get("score", 0)) - 25)
+        intent.setdefault("signals", []).append("Customer declined current purchase")
+        score_value = int(intent.get("score", 0))
+        intent["status"] = (
+            "very_high" if score_value >= 80 else
+            "high" if score_value >= 60 else
+            "medium" if score_value >= 40 else "low"
+        )
+
     _record_customer_turn(
 
         session=session,
@@ -2427,25 +2461,42 @@ def _process_message_impl(
 
     )
 
-    if extracted_product and _is_specific_product_mentioned(message, extracted_product):
-
+    current_product = str(customer.get("product_interest") or extracted_product or "").strip()
+    # Storage may already be embedded in the extracted product name; avoid
+    # duplicating it when constructing the exact catalogue variant query.
+    current_product = re.sub(r"\b\d{1,4}\s*(?:gb|tb)\b", "", current_product, flags=re.I).strip()
+    current_storage = str(customer.get("storage") or "").strip()
+    variant_key = f"{current_product} {current_storage}".strip()
+    product_named_now = bool(
+        extracted_product and _is_specific_product_mentioned(message, extracted_product)
+    )
+    variant_supplied_now = bool(extracted.get("storage") and current_product)
+    variant_is_complete = bool(current_product and current_storage)
+    should_lookup_variant = (
+        variant_is_complete
+        and (product_named_now or variant_supplied_now)
+        and str(session.get("catalog_product") or "").strip().lower() != variant_key.lower()
+    )
+    if should_lookup_variant:
+        # At this point the customer has supplied both model and storage. Query
+        # the combined variant even if storage arrived in a separate message.
         product_message = _get_product_message(
-
-            extracted_product,
-
-            message,
-
+            variant_key,
+            variant_key,
             active_language,
-
         )
-
         session["catalog_message_sent"] = bool(product_message)
+        session["catalog_product"] = variant_key if product_message else None
 
-        session["catalog_product"] = extracted_product if product_message else None
-
+    all_qualification_fields_complete = all(
+        _field_is_complete(field, customer) for field in FIELD_ORDER
+    )
+    answering_intent_question = bool(
+        session.get("intent_question_asked") and all_qualification_fields_complete
+    )
     nonbuyer_mode = _nonbuyer_mode(message)
 
-    if nonbuyer_mode:
+    if nonbuyer_mode == "decline" and not answering_intent_question:
 
         soft_reply = _low_pressure_reply(nonbuyer_mode, active_language)
 
@@ -2593,61 +2644,33 @@ def _process_message_impl(
 
     # ---------------------------------------------------------
 
-    if not session[
+    if not session["intent_question_asked"]:
 
-        "intent_question_asked"
-
-    ]:
-
-        session[
-
-            "intent_question_asked"
-
-        ] = True
+        session["intent_question_asked"] = True
 
         # Ask a question that matches the customer's buying stage instead of
 
         # using the same hard close for every customer.
 
         intent_status = str(session.get("intent", {}).get("status", "low")).lower()
-
-        if intent_status in {"very_high", "high"}:
-
-            draft_reply = INTENT_QUESTION
-
-        elif intent_status == "medium":
-
-            draft_reply = (
-
-                "Just so I can guide you properly, are you planning to buy "
-
-                "within the next few weeks, or are you comparing options for now?"
-
-            )
-
-        else:
-
-            if customer.get("purchase_timeline"):
-
-                draft_reply = (
-
-                    "No pressure at all. I can help compare options. "
-
-                    "If you find a phone that fits your budget, would you like the store "
-
-                    "to confirm its latest price and availability?"
-
-                )
-
+        if active_language == "telugu":
+            if intent_status in {"very_high", "high"}:
+                draft_reply = "ధర, స్టాక్ మీకు సరిపోతే కొనుగోలు చేయడానికి ముందుకు వెళ్లాలనుకుంటున్నారా?"
+            elif intent_status == "medium":
+                draft_reply = "మీకు సరైన ఫోన్ ఎంచుకోవడానికి అడుగుతున్నాను—రాబోయే కొన్ని వారాల్లో కొనాలనుకుంటున్నారా, లేక ప్రస్తుతం మోడళ్లను పోల్చి చూస్తున్నారా?"
+            elif customer.get("purchase_timeline"):
+                draft_reply = "ఒత్తిడి లేదు 😊 మీ బడ్జెట్‌కు సరిపోయే ఫోన్ దొరికితే, తాజా ధర మరియు స్టాక్‌ను స్టోర్‌తో నిర్ధారించమంటారా?"
             else:
-
-                draft_reply = (
-
-                    "No pressure at all. I can help compare a few phones too. "
-
-                    "Are you exploring options, or do you have a rough time in mind to buy?"
-
-                )
+                draft_reply = "ఒత్తిడి లేదు 😊 మీరు మోడళ్లను పరిశీలిస్తున్నారా, లేక కొనడానికి ఏదైనా సమయం అనుకుంటున్నారా?"
+        else:
+            if intent_status in {"very_high", "high"}:
+                draft_reply = "Price mariyu stock meeku set aithe purchase proceed avvalanukuntunnara?"
+            elif intent_status == "medium":
+                draft_reply = "Meeku correct phone suggest cheyyadaniki aduguthunna—next few weeks lo konalanukuntunnara, leka ippatiki models compare chesthunnara?"
+            elif customer.get("purchase_timeline"):
+                draft_reply = "Pressure ledu 😊 Mee budget ki set ayye phone dorikithe, latest price mariyu stock store tho confirm cheyamantara?"
+            else:
+                draft_reply = "Pressure ledu 😊 Ippatiki options compare chesthunnara, leka konadaniki rough timeline emaina undha?"
 
         session["_return_template_reply"] = True
         return {
@@ -2682,6 +2705,42 @@ def _process_message_impl(
             "lead_saved": False,
 
         }
+
+    # The final intent prompt must receive a meaningful answer. Do not mark a
+    # lead complete just because any arbitrary message arrived after the prompt.
+    if session.get("intent_question_asked"):
+        clear_intent_answer = _is_clear_intent_response(message) or _has_any(
+            message.lower(), [
+                "exploring options", "compare options", "just comparing",
+                "only comparing", "just browsing", "just checking",
+                "not sure yet", "inka chustunna", "inka choostunna",
+                "ఇంకా చూస్తున్నాను", "ఇంకా నిర్ణయించుకోలేదు",
+            ]
+        )
+        if not clear_intent_answer:
+            if active_language == "telugu":
+                intent_clarification = (
+                    "ధన్యవాదాలు 😊 మీకు సరైన విధంగా సహాయం చేయడానికి ఒక విషయం చెప్పండి: "
+                    "బడ్జెట్‌కు సరిపోయే ఫోన్ దొరికితే త్వరలో కొనాలనుకుంటున్నారా, "
+                    "లేక ప్రస్తుతం మోడళ్లను పోల్చి చూస్తున్నారా?"
+                )
+            else:
+                intent_clarification = (
+                    "Sare 😊 Mee interest correct ga ardham chesukovadaniki cheppandi: "
+                    "mee budget ki set ayye phone dorikithe tvaralo konalanukuntunnara, "
+                    "leka ippatiki models compare chesthunnara?"
+                )
+            session["_return_template_reply"] = True
+            return {
+                "customer_id": customer_id,
+                "message": intent_clarification,
+                "customer": customer,
+                "qualification": None,
+                "intent": session.get("intent"),
+                "intent_history": session.get("intent_history", []),
+                "lead_id": session.get("lead_id"),
+                "lead_saved": False,
+            }
 
     # ---------------------------------------------------------
 
@@ -2937,6 +2996,28 @@ def _process_message_impl(
 
     }
 
+def _history_has_intent_question(history: list) -> bool:
+    markers = (
+        "purchase proceed avvalanukuntunnara",
+        "next few weeks lo konalanukuntunnara",
+        "options compare chesthunnara",
+        "confirm cheyamantara",
+        "would you like to proceed",
+        "comparing options for now",
+        "కొనుగోలు చేయడానికి ముందుకు",
+        "రాబోయే కొన్ని వారాల్లో కొనాలనుకుంటున్నారా",
+        "మోడళ్లను పోల్చి చూస్తున్నారా",
+        "ధర మరియు స్టాక్‌ను స్టోర్‌తో నిర్ధారించమంటారా",
+    )
+    for item in reversed(history or []):
+        if not isinstance(item, dict) or item.get("sender_type") != "assistant":
+            continue
+        text = str(item.get("message") or "").lower()
+        if any(marker in text for marker in markers):
+            return True
+    return False
+
+
 def _restore_session_from_storage(customer_id: str) -> Optional[dict]:
 
     """Recover a customer's latest lead/session after a process restart."""
@@ -3011,18 +3092,19 @@ def _restore_session_from_storage(customer_id: str) -> Optional[dict]:
 
         "asked_field": next(
 
-            (field for field in FIELD_ORDER if not _field_is_complete(field, customer)),
+            (field for field in RESTORE_FIELD_ORDER if not _field_is_complete(field, customer)),
 
             "intent",
 
         ),
 
         "lead_saved": (
-
             conversation_status == "completed"
-
             or intent.get("session_status") == "completed"
-
+        ),
+        "_restored_completed_session": (
+            conversation_status == "completed"
+            or intent.get("session_status") == "completed"
         ),
 
         "lead_id": lead.get("lead_id"),
@@ -3049,7 +3131,11 @@ def _restore_session_from_storage(customer_id: str) -> Optional[dict]:
 
         "conversation_history": history,
 
-        "intent_question_asked": conversation_status == "completed",
+        "intent_question_asked": (
+            conversation_status == "completed"
+            or intent.get("session_status") == "completed"
+            or _history_has_intent_question(history)
+        ),
 
         "catalog_message_sent": bool(customer.get("product_interest")),
 
@@ -3064,6 +3150,134 @@ def _restore_session_from_storage(customer_id: str) -> Optional[dict]:
 # customer's last message. The partial lead remains permanently in Supabase.
 
 SESSION_TIMEOUT = timedelta(minutes=30)
+
+def _is_greeting_message(message: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9\u0c00-\u0c7f]+", " ", (message or "").lower()).strip()
+    return bool(re.fullmatch(
+        r"(?:hi|hii|hiii|hello|hey|hai|gm|good morning|good afternoon|good evening|namaste|namaskar|howdy|how are you|hey there|hello there|hi there|what s up|\u0c39\u0c3e\u0c2f\u0c4d|\u0c39\u0c32\u0c4b|\u0c28\u0c2e\u0c38\u0c4d\u0c15\u0c3e\u0c30\u0c02)"
+        r"(?:\s+(?:bro|anna|sir|madam|boss))?",
+        normalized,
+    ))
+
+
+def _begin_new_cycle_after_completed_lead(session: dict, customer_id: str) -> None:
+    """Re-open a completed lead when the customer starts a fresh conversation.
+
+    Keep the same database record and full historical chat, but clear the active
+    qualification answers so the new greeting does not route all later messages
+    into the post-completion follow-up handler.
+    """
+    customer = session.setdefault("customer", {})
+    preserved = {key: customer[key] for key in ("phone_number", "name") if customer.get(key)}
+    for field in set(FIELD_ORDER) | EXTRA_FIELDS | {
+        "model", "brand", "product_name", "intent_to_buy", "buying_intent"
+    }:
+        customer.pop(field, None)
+    customer.update(preserved)
+    if customer_id.startswith("wa_"):
+        customer["phone_number"] = customer_id[3:]
+    elif customer_id.replace("+", "").isdigit():
+        customer["phone_number"] = customer_id
+    session.update({
+        "asked_field": "product_interest",
+        "lead_saved": False,
+        "qualification": None,
+        "intent": {"score": 0, "status": "low", "signals": [], "session_status": "active"},
+        "intent_history": [],
+        "intent_question_asked": False,
+        "catalog_message_sent": False,
+        "catalog_product": None,
+        "_restored_completed_session": False,
+        "last_activity": None,
+    })
+
+
+def _is_clear_intent_response(message: str) -> bool:
+    text = (message or "").strip().lower()
+    if text in {
+        "yes", "yes definitely", "definitely", "sure", "absolutely", "yeah", "yep",
+        "no", "nope", "not now", "maybe later", "just comparing", "only comparing",
+        "just browsing", "just checking", "not sure yet",
+        "avunu", "konestha", "konukunta", "konali", "అవును", "ఖచ్చితంగా", "కాదు",
+    }:
+        return True
+    positive_phrases = (
+        "i want to buy", "i will buy", "i'll buy", "want to purchase", "buy it today",
+        "proceed with the purchase", "go ahead with the purchase", "reserve one",
+        "book it", "payment link", "konali", "konestha", "konukunta", "కొనాలి",
+        "కొనేస్తాను", "కొనాలని ఉంది", "బుక్ చేయండి",
+    )
+    if any(phrase in text for phrase in positive_phrases):
+        return True
+    return _negative_intent(message) < 0
+
+
+def _is_valid_answer_for_current_field(message: str, session: dict) -> bool:
+    """Recognize concise answers before deciding whether a message is off-topic."""
+    text = (message or "").strip().lower()
+    field = session.get("asked_field")
+    if not text:
+        return False
+    if session.get("intent_question_asked") and _is_clear_intent_response(message):
+        return True
+    if field == "budget" and re.search(r"\d", text):
+        return True
+    if field == "storage" and re.search(r"\b\d{1,4}\s*(?:gb|tb)\b", text):
+        return True
+    if field == "purchase_timeline" and re.search(
+        r"\b(today|tomorrow|tonight|this week|next week|this month|next month|later|within|week|month|ivala|eeroju|repu|tarvatha|tarwatha)\b|\u0c30\u0c47\u0c2a\u0c41|\u0c08 \u0c35\u0c3e\u0c30\u0c02",
+        text,
+    ):
+        return True
+    if field == "condition" and re.search(r"\b(new|brand new|sealed|used|second hand|refurbished|kotha|kottha)\b|\u0c15\u0c4a\u0c24\u0c4d\u0c24|\u0c35\u0c3e\u0c21\u0c3f\u0c28", text):
+        return True
+    if field == "payment_method" and re.search(r"\b(cash|card|upi|gpay|phonepe|paytm|emi|yes|any)\b", text):
+        return True
+    if field == "location" and len(text.split()) <= 3 and re.fullmatch(r"[a-zA-Z][a-zA-Z .'-]{1,49}", message.strip()):
+        return True
+    if field == "product_interest" and re.search(r"\b(iphone|samsung|oneplus|oppo|vivo|realme|redmi|xiaomi|google pixel|motorola|nothing|mobile|phone)\b|\b[a-z]+\s*\d{1,3}\b", text):
+        return True
+    return False
+
+
+def _is_business_related_message(message: str, session: dict) -> bool:
+    """Conservative local scope gate: no model call for obvious unrelated input."""
+    text = (message or "").strip().lower()
+
+    # Explicit off-topic intent takes precedence over field heuristics. For example,
+    # "write a poem" must not be mistaken for a town name when location is pending.
+    off_topic_terms = (
+        "tell me a joke", "make me laugh", "write a poem", "solve my homework",
+        "do my assignment", "weather forecast", "news about politics", "political news",
+        "recipe for", "cook biryani", "who won the match", "cricket score",
+        "translate this sentence", "write a love letter", "generate an image",
+        "debug my code", "write python code", "what is the capital",
+    )
+    if any(term in text for term in off_topic_terms):
+        return False
+    if re.fullmatch(r"(how are you|what are you doing|tell me something|who are you|what is your name)[?.! ]*", text):
+        return False
+    if _is_valid_answer_for_current_field(message, session):
+        return True
+
+    business_terms = (
+        "phone", "mobile", "iphone", "samsung", "oneplus", "oppo", "vivo",
+        "realme", "redmi", "xiaomi", "pixel", "motorola", "nothing phone",
+        "price", "cost", "budget", "storage", "gb", "tb", "variant", "model",
+        "available", "stock", "battery", "camera", "display", "gaming", "warranty",
+        "exchange", "emi", "cash", "card", "upi", "delivery", "discount", "offer",
+        "store", "brand new", "sealed", "used", "refurbished", "compare", "recommend",
+        "better phone", "which phone", "which mobile", "phone kavali", "mobile kavali",
+        "konali", "konukunta", "dhara", "entha", "ధర", "మొబైల్", "ఫోన్", "కొనాలి",
+        "స్టాక్", "బ్యాటరీ", "కెమెరా",
+    )
+    return any(term in text for term in business_terms)
+
+def _out_of_scope_reply(language: str) -> str:
+    if language == "telugu":
+        return "క్షమించండి 😊 నేను Mania Mobiles‌కు సంబంధించిన మొబైల్ మోడళ్లు, ధరలు, స్టాక్, ఫీచర్లు, కొనుగోలు వివరాల్లో సహాయం చేయగలను. మీకు ఏ మొబైల్ గురించి తెలుసుకోవాలి?"
+    return "Sorry 😊 Nenu Mania Mobiles mobile models, prices, stock, features mariyu purchase details gurinchi help cheyagalanu. Meeku ye mobile gurinchi telusukovali?"
+
 
 def _process_message_serialized(customer_id: str, message: str) -> dict:
 
@@ -3087,7 +3301,10 @@ def _process_message_serialized(customer_id: str, message: str) -> dict:
 
         session = _restore_session_from_storage(customer_id)
 
-    if session and session.get("last_activity"):
+    # Only expire incomplete active qualification sessions. Completed records
+    # remain attached to the same lead so a new greeting can re-open that record
+    # instead of creating a duplicate lead after 30 minutes or a worker restart.
+    if session and session.get("last_activity") and not session.get("lead_saved"):
 
         try:
 
@@ -3145,48 +3362,45 @@ def _process_message_serialized(customer_id: str, message: str) -> dict:
 
     session = _get_session(customer_id)
 
-    previous_history_len = len(session.get("conversation_history", []))
+    # A greeting after a restored completed record starts a fresh qualification
+    # cycle on the same lead row. Otherwise lead_saved=True would send every
+    # answer to _handle_saved_lead_follow_up and stop collecting required fields.
+    is_greeting = _is_greeting_message(message)
+    if is_greeting and session.get("lead_saved"):
+        _begin_new_cycle_after_completed_lead(session, customer_id)
 
-    # Handle greetings deterministically BEFORE calling the LLM. This avoids
-    # a saved/restored lead turning "Hi" into "I've updated your requirements"
-    # on every message, and prevents greetings from changing qualification scores.
-    normalized_greeting = re.sub(
-        r"[^a-z0-9\u0c00-\u0c7f]+",
-        " ",
-        message.lower(),
-    ).strip()
-    is_greeting = bool(
-        re.fullmatch(
-            r"(?:hi|hii|hiii|hello|hey|hai|హాయ్|హలో|నమస్కారం)"
-            r"(?:\s+(?:bro|anna|sir|madam|boss))?",
-            normalized_greeting,
-        )
-    )
+    previous_history_len = len(session.get("conversation_history", []))
 
     if is_greeting:
         language = _resolve_response_language(message, session)
-        if language == "telugu":
-            if previous_history_len == 0:
-                greeting_reply = (
-                    "నమస్కారం! Mania Mobiles‌కు స్వాగతం 😊 "
-                    "మీకు ఏ మొబైల్ కావాలి? బ్రాండ్, మోడల్ పేరు చెప్పండి."
-                )
-            else:
-                greeting_reply = (
-                    "హాయ్ 😊 మీకు ఏ మొబైల్ కావాలి? బ్రాండ్, మోడల్ పేరు చెప్పండి. "
-                    "ఉదాహరణకు: iPhone 15 128GB."
-                )
+        next_missing_field = next(
+            (field for field in FIELD_ORDER if not _field_is_complete(field, session.get("customer", {}))),
+            None,
+        )
+        if previous_history_len > 0 and next_missing_field:
+            question = _localized_question(next_missing_field, language, session.get("customer", {}))
+            greeting_reply = (
+                ("హాయ్ 😊 " if language == "telugu" else "Hi 😊 ") + question
+            )
+        elif previous_history_len > 0 and session.get("intent_question_asked"):
+            greeting_reply = (
+                "ధర, స్టాక్ మీకు సరిపోతే కొనుగోలు చేయాలనుకుంటున్నారా?"
+                if language == "telugu"
+                else "Price mariyu stock meeku set aithe purchase proceed avvalanukuntunnara?"
+            )
+        elif language == "telugu":
+            greeting_reply = (
+                "నమస్కారం! Mania Mobiles‌కు స్వాగతం 😊 "
+                "మీకు ఏ మొబైల్ కావాలి? బ్రాండ్, మోడల్ పేరు చెప్పండి."
+                if previous_history_len == 0
+                else "హాయ్ 😊 మీకు ఏ మొబైల్ కావాలి? బ్రాండ్, మోడల్ పేరు చెప్పండి. ఉదాహరణకు: iPhone 15 128GB."
+            )
         else:
-            if previous_history_len == 0:
-                greeting_reply = (
-                    "Hi! Mania Mobiles ki welcome 😊 "
-                    "Meeku ye mobile kavali? Brand mariyu model peru cheppandi."
-                )
-            else:
-                greeting_reply = (
-                    "Hi 😊 Meeku ye mobile kavali? Brand mariyu model peru cheppandi. "
-                    "Example: iPhone 15 128GB."
-                )
+            greeting_reply = (
+                "Hi! Mania Mobiles ki welcome 😊 Meeku ye mobile kavali? Brand mariyu model peru cheppandi."
+                if previous_history_len == 0
+                else "Hi 😊 Meeku ye mobile kavali? Brand mariyu model peru cheppandi. Example: iPhone 15 128GB."
+            )
 
         result = {
             "customer_id": customer_id,
@@ -3199,7 +3413,22 @@ def _process_message_serialized(customer_id: str, message: str) -> dict:
             "lead_saved": bool(session.get("lead_saved")),
         }
     else:
-        result = _process_message_impl(customer_id, message)
+        # Validate scope before extraction/response generation. Valid short answers
+        # (for example "82000", "128GB", or "Bhimavaram") are allowed by field state.
+        if not _is_business_related_message(message, session):
+            language = _resolve_response_language(message, session)
+            result = {
+                "customer_id": customer_id,
+                "message": _out_of_scope_reply(language),
+                "customer": session.get("customer", {}),
+                "qualification": session.get("qualification"),
+                "intent": session.get("intent"),
+                "intent_history": session.get("intent_history", []),
+                "lead_id": session.get("lead_id"),
+                "lead_saved": bool(session.get("lead_saved")),
+            }
+        else:
+            result = _process_message_impl(customer_id, message)
 
     session = _get_session(customer_id)
 
