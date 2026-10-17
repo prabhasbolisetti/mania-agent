@@ -2488,10 +2488,18 @@ def _store_faq_reply(message: str, language: str) -> Optional[str]:
     if language == "telugu":
         parts = []
         if asks_emi:
-            parts.append("EMI సదుపాయం నెల్లూరు మరియు పరిసర ప్రాంతాల్లో మాత్రమే అందుబాటులో ఉంటుంది. అర్హత, బ్యాంక్ ఆఫర్లు, ప్రస్తుత నిబంధనలను స్టోర్‌లో నిర్ధారించాలి.")
+            parts.append("EMI సదుపాయం నెల్లూరు మరియు పరిసర ప్రాంతాల్లో మాత్రమే అందుబాటులో ఉంటుంది. అర్హత, బ్యాంక్ ఆఫర్లు, ప్రస్తుత నిబంధనలను స్టోర్‌లో నిర్ధారించండి; ఇక్కడ ఆమోదం హామీ ఇవ్వలేను.")
         if asks_exchange:
-            parts.append("ఎక్స్చేంజ్ విలువ పాత ఫోన్ మోడల్, స్టోరేజ్, కండిషన్‌పై ఆధారపడి ఉంటుంది. మీ పాత ఫోన్ మోడల్, స్టోరేజ్ వివరాలు చెప్పండి; ఖచ్చితమైన విలువ కోసం స్టోర్‌ను సందర్శించండి.")
+            parts.append("మీ పాత ఫోన్ ఎక్స్చేంజ్ విలువ దాని మోడల్, స్టోరేజ్, కండిషన్‌పై ఆధారపడి ఉంటుంది. ఖచ్చితమైన విలువ కోసం పాత ఫోన్‌ను స్టోర్‌కు తీసుకెళ్లి తనిఖీ చేయించండి. మీ ఫోన్ స్టోరేజ్, కండిషన్ చెబితే తదుపరి వివరాలు సూచిస్తాను.")
         parts.append(f"స్టోర్: {MANIA_STORE_ADDRESS}. Google Maps: {MANIA_STORE_MAPS_URL}")
+        return "\n\n".join(parts)
+    if language == "roman_telugu":
+        parts = []
+        if asks_emi:
+            parts.append("EMI facility Nellore mariyu surrounding areas lo matrame available. Mee eligibility, current bank offers, terms store daggara confirm chesukondi; ikkada approval guarantee cheyyalenu.")
+        if asks_exchange:
+            parts.append("Mee old phone exchange value model, storage mariyu condition batti untundi. Exact value kosam old phone ni store ki teesukelli inspection cheyinchandi. Mee phone storage, condition chepthe next steps chepthanu.")
+        parts.append(f"Store: {MANIA_STORE_ADDRESS}. Google Maps: {MANIA_STORE_MAPS_URL}")
         return "\n\n".join(parts)
     parts = []
     if asks_emi:
@@ -4022,8 +4030,10 @@ def _is_business_related_message(message: str, session: dict) -> bool:
 
 def _out_of_scope_reply(language: str) -> str:
     if language == "telugu":
-        return "క్షమించండి 😊 నేను Mania Mobiles‌కు సంబంధించిన మొబైల్ మోడళ్లు, ధరలు, స్టాక్, ఫీచర్లు, కొనుగోలు వివరాల్లో సహాయం చేయగలను. మీకు ఏ మొబైల్ గురించి తెలుసుకోవాలి?"
-    return "Sorry 😊 Nenu Mania Mobiles mobile models, prices, stock, features mariyu purchase details gurinchi help cheyagalanu. Meeku ye mobile gurinchi telusukovali?"
+        return "క్షమించండి 😊 Mania Mobiles‌కు సంబంధించిన మొబైల్ ధరలు, స్టాక్, ఫీచర్లు, EMI, ఎక్స్చేంజ్, కొనుగోలు వివరాల్లో సహాయం చేయగలను. మీ ప్రశ్నను కొంచెం వివరంగా చెప్పండి."
+    if language == "roman_telugu":
+        return "Sorry 😊 Mania Mobiles mobile prices, stock, features, EMI, exchange mariyu purchase details lo help chestha. Mee question ni konchem detail ga cheppandi."
+    return "Sorry 😊 I can help with Mania Mobiles prices, stock, features, EMI, exchange, and purchase details. Please tell me a little more about your question."
 
 
 def _process_message_serialized(customer_id: str, message: str) -> dict:
@@ -4173,15 +4183,15 @@ def _process_message_serialized(customer_id: str, message: str) -> dict:
             )
         elif language == "telugu":
             greeting_reply = (
-                "నమస్కారం! Mania Mobiles‌కు స్వాగతం 😊 మొబైల్ మోడళ్లు, ధరలు, కలర్స్, స్టోరేజ్ ఆప్షన్లలో సహాయం చేస్తాను. మీకు ఏ మొబైల్ గురించి తెలుసుకోవాలి? ఏ బ్రాండ్/మోడల్ అయినా చెప్పండి."
+                "నమస్కారం! Mania Mobiles‌కు స్వాగతం 😊 మీ ఫోన్ కొనుగోలుకు సంబంధించిన సందేహాల్లో సహాయం చేస్తాను. మీరు చూస్తున్న బ్రాండ్/మోడల్ పేరు చెప్పండి. ఉదాహరణకు iPhone 16."
                 if previous_history_len == 0
-                else "హాయ్ 😊 మొబైల్ మోడళ్లు, ధరలు, కలర్స్, స్టోరేజ్ ఆప్షన్లలో సహాయం చేస్తాను. ఏ బ్రాండ్/మోడల్ చూస్తున్నారు? ఉదాహరణకు iPhone 16."
+                else "హాయ్ 😊 మీ ఫోన్ కొనుగోలుకు సంబంధించిన సందేహాల్లో సహాయం చేస్తాను. మీరు చూస్తున్న బ్రాండ్/మోడల్ పేరు చెప్పండి. ఉదాహరణకు iPhone 16."
             )
         else:
             greeting_reply = (
-                "Hi! Mania Mobiles ki welcome 😊 Mobile models, prices, colors, storage options lo help chestha. Meeku ye mobile gurinchi telusukovali? Ye brand/model aina cheppandi."
+                "Hi! Mania Mobiles ki welcome 😊 Mee phone purchase ki sambandhinchina questions lo help chestha. Ye brand/model chusthunnaru? Example: iPhone 16."
                 if previous_history_len == 0
-                else "Hi 😊 Mobile models, prices, colors, storage options lo help chestha. Ye brand/model chusthunnaru? Example: iPhone 16."
+                else "Hi 😊 Mee phone purchase ki sambandhinchina questions lo help chestha. Ye brand/model chusthunnaru? Example: iPhone 16."
             )
 
         result = {
