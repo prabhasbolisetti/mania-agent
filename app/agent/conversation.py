@@ -3147,19 +3147,61 @@ def _process_message_serialized(customer_id: str, message: str) -> dict:
 
     previous_history_len = len(session.get("conversation_history", []))
 
-    result = _process_message_impl(customer_id, message)
+    # Handle greetings deterministically BEFORE calling the LLM. This avoids
+    # a saved/restored lead turning "Hi" into "I've updated your requirements"
+    # on every message, and prevents greetings from changing qualification scores.
+    normalized_greeting = re.sub(
+        r"[^a-z0-9\u0c00-\u0c7f]+",
+        " ",
+        message.lower(),
+    ).strip()
+    is_greeting = bool(
+        re.fullmatch(
+            r"(?:hi|hii|hiii|hello|hey|hai|హాయ్|హలో|నమస్కారం)"
+            r"(?:\s+(?:bro|anna|sir|madam|boss))?",
+            normalized_greeting,
+        )
+    )
+
+    if is_greeting:
+        language = _resolve_response_language(message, session)
+        if language == "telugu":
+            if previous_history_len == 0:
+                greeting_reply = (
+                    "నమస్కారం! Mania Mobiles‌కు స్వాగతం 😊 "
+                    "మీకు ఏ మొబైల్ కావాలి? బ్రాండ్, మోడల్ పేరు చెప్పండి."
+                )
+            else:
+                greeting_reply = (
+                    "హాయ్ 😊 మీకు ఏ మొబైల్ కావాలి? బ్రాండ్, మోడల్ పేరు చెప్పండి. "
+                    "ఉదాహరణకు: iPhone 15 128GB."
+                )
+        else:
+            if previous_history_len == 0:
+                greeting_reply = (
+                    "Hi! Mania Mobiles ki welcome 😊 "
+                    "Meeku ye mobile kavali? Brand mariyu model peru cheppandi."
+                )
+            else:
+                greeting_reply = (
+                    "Hi 😊 Meeku ye mobile kavali? Brand mariyu model peru cheppandi. "
+                    "Example: iPhone 15 128GB."
+                )
+
+        result = {
+            "customer_id": customer_id,
+            "message": greeting_reply,
+            "customer": session.get("customer", {}),
+            "qualification": session.get("qualification"),
+            "intent": session.get("intent"),
+            "intent_history": session.get("intent_history", []),
+            "lead_id": session.get("lead_id"),
+            "lead_saved": bool(session.get("lead_saved")),
+        }
+    else:
+        result = _process_message_impl(customer_id, message)
 
     session = _get_session(customer_id)
-
-    if previous_history_len == 0 and message.lower().strip() in {"hi", "hello", "hey", "hii", "hai", "నమస్కారం", "హాయ్"}:
-
-        if session.get("language") == "telugu":
-
-            result["message"] = "నమస్కారం! Mania Mobiles‌కు స్వాగతం 😊 మీకు ఏ మొబైల్ కావాలి? బ్రాండ్, మోడల్ పేరు చెప్పండి."
-
-        else:
-
-            result["message"] = "Hi! Mania Mobiles ki welcome 😊 Meeku ye mobile kavali? Brand mariyu model peru cheppandi."
 
     # Extraction can fail before the core function records the customer turn;
 
