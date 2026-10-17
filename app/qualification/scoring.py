@@ -263,9 +263,15 @@ def calculate_intent(
         score += 5
         signals.append("Condition specified")
 
-    if _text(customer.get("payment_method")):
+    payment_method = _text(customer.get("payment_method"))
+    payment_was_deferred = bool(customer.get("payment_method_declined")) or payment_method.lower() in {
+        "not specified", "later", "undecided", "prefer not to say", "not decided"
+    }
+    if payment_method and not payment_was_deferred:
         score += 10
         signals.append("Payment method provided")
+    elif payment_was_deferred:
+        signals.append("Payment preference deferred; no payment points")
 
     if _text(customer.get("location")):
         score += 5
