@@ -3,6 +3,8 @@ import json
 import hmac
 import hashlib
 import traceback
+from threading import Lock
+from collections import deque
 from fastapi import APIRouter, HTTPException, Request, Depends, Response
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
@@ -24,6 +26,41 @@ from app.config import env_bool
 router = APIRouter()
 WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "")
 WHATSAPP_APP_SECRET = os.getenv("WHATSAPP_APP_SECRET", "")
+
+# Meta may retry while the first webhook is still processing. The database
+# check handles persisted IDs; this in-process guard prevents concurrent
+# requests in the same Render worker from sending the same reply twice.
+_WEBHOOK_ID_LOCK = Lock()
+_WEBHOOK_INFLIGHT_IDS = set()
+_WEBHOOK_COMPLETED_IDS = set()
+_WEBHOOK_COMPLETED_ORDER = deque()
+_WEBHOOK_COMPLETED_LIMIT = 5000
+
+
+def _claim_whatsapp_message_id(message_id: str) -> bool:
+    message_id = str(message_id or "").strip()
+    if not message_id:
+        return True
+    with _WEBHOOK_ID_LOCK:
+        if message_id in _WEBHOOK_INFLIGHT_IDS or message_id in _WEBHOOK_COMPLETED_IDS:
+            return False
+        _WEBHOOK_INFLIGHT_IDS.add(message_id)
+        return True
+
+
+def _finish_whatsapp_message_id(message_id: str, completed: bool = False) -> None:
+    message_id = str(message_id or "").strip()
+    if not message_id:
+        return
+    with _WEBHOOK_ID_LOCK:
+        _WEBHOOK_INFLIGHT_IDS.discard(message_id)
+        if not completed or message_id in _WEBHOOK_COMPLETED_IDS:
+            return
+        if len(_WEBHOOK_COMPLETED_ORDER) >= _WEBHOOK_COMPLETED_LIMIT:
+            expired = _WEBHOOK_COMPLETED_ORDER.popleft()
+            _WEBHOOK_COMPLETED_IDS.discard(expired)
+        _WEBHOOK_COMPLETED_ORDER.append(message_id)
+        _WEBHOOK_COMPLETED_IDS.add(message_id)
 
 # =========================================================
 # ADMIN AUTHENTICATION
@@ -381,13 +418,17 @@ async def whatsapp_webhook(request: Request):
                     print("======================================\n")
                     whatsapp_message_id = message.get("id")
                     if whatsapp_message_id:
+                        if not _claim_whatsapp_message_id(whatsapp_message_id):
+                            print("Ignoring duplicate/in-flight WhatsApp message ID.")
+                            continue
                         try:
                             if await run_in_threadpool(has_processed_whatsapp_message, whatsapp_message_id):
-                                print("Ignoring duplicate WhatsApp message ID.")
+                                print("Ignoring previously processed WhatsApp message ID.")
+                                _finish_whatsapp_message_id(whatsapp_message_id, completed=True)
                                 continue
                         except Exception as exc:
                             # Continue service during a temporary lookup failure;
-                            # database errors are logged without exposing customer data.
+                            # the in-process claim still prevents concurrent duplicates.
                             print("Webhook deduplication lookup failed:", type(exc).__name__)
                     customer_id = f"wa_{sender}"
                     # -------------------------------------------------
@@ -417,6 +458,7 @@ async def whatsapp_webhook(request: Request):
                         print("============================================\n")
                         # Do not send a fake response. The traceback above
                         # exposes the real failure so it can be fixed.
+                        _finish_whatsapp_message_id(whatsapp_message_id)
                         continue
                     # -------------------------------------------------
                     # 5. Extract and send agent response
@@ -439,6 +481,7 @@ async def whatsapp_webhook(request: Request):
                                 message_text,
                                 whatsapp_message_id,
                             )
+                            _finish_whatsapp_message_id(whatsapp_message_id, completed=True)
                         print("\n========== WHATSAPP SEND RESULT ==========")
                         print("Meta accepted outbound message.")
                         print("===========================================\n")
@@ -454,6 +497,7 @@ async def whatsapp_webhook(request: Request):
                         print("Full traceback:")
                         traceback.print_exc()
                         print("==========================================\n")
+                        _finish_whatsapp_message_id(whatsapp_message_id)
                         continue
     except Exception as exc:
         print(

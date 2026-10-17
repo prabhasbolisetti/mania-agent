@@ -4552,5 +4552,385 @@
     "variants": [],
     "source": "https://maniamobiles.com",
     "scraped_at": "2026-10-03T16:53:03Z"
+  },
+  {
+    "product_name": "iPhone 16 128GB Black Color",
+    "product_url": "https://maniamobiles.com/product/iphone-16-128gb-black-color-2/",
+    "sku": "351812471809312",
+    "brand": "Apple",
+    "model": "iPhone 16",
+    "gtin": null,
+    "mpn": null,
+    "price_inr": 58999.0,
+    "regular_price_inr": 73999.0,
+    "currency": "INR",
+    "price_source": "official_product_page",
+    "price_needs_verification": true,
+    "stock_status": "out_of_stock",
+    "availability_source": "official product page; recheck before quoting",
+    "categories": [
+      "Mobiles",
+      "APPLE",
+      "IPHONE 16 SERIES",
+      "IPHONE 16",
+      "Device Category"
+    ],
+    "image_urls": [],
+    "short_description": "iPhone 16, 128GB, Black, listed as Superb condition.",
+    "description": "Official Mania Mobiles product listing. Page listed ₹58,999 against ₹73,999 regular price and showed out of stock when checked. Verify current price, condition, warranty and stock with the store.",
+    "attributes": {
+      "storage": "128GB",
+      "color": "Black",
+      "condition": "Superb",
+      "variant": "Indian",
+      "brand_box": true,
+      "bill_available": true
+    },
+    "specifications": {
+      "storage": "128GB",
+      "warranty": "Brand warranty listed on product page; verify current status"
+    },
+    "variants": [],
+    "source": "https://maniamobiles.com",
+    "scraped_at": "2026-10-17T00:00:00Z"
+  },
+  {
+    "product_name": "iPhone 16 128GB Teal Color",
+    "product_url": "https://maniamobiles.com/product/iphone-16-128gb-teal-color-7/",
+    "brand": "Apple",
+    "model": "iPhone 16",
+    "price_inr": 55999.0,
+    "regular_price_inr": 84999.0,
+    "currency": "INR",
+    "price_source": "official_product_page",
+    "price_needs_verification": true,
+    "stock_status": "out_of_stock",
+    "availability_source": "official product page; recheck before quoting",
+    "categories": [
+      "Mobiles",
+      "APPLE",
+      "IPHONE 16 SERIES",
+      "IPHONE 16",
+      "Device Category"
+    ],
+    "image_urls": [],
+    "short_description": "iPhone 16, 128GB, Teal, listed as Superb condition.",
+    "description": "Official Mania Mobiles product listing. Page listed ₹55,999 against ₹84,999 regular price and showed out of stock when checked. Verify current price, condition, warranty and stock with the store.",
+    "attributes": {
+      "storage": "128GB",
+      "color": "Teal",
+      "condition": "Superb",
+      "variant": "Indian",
+      "brand_box": true,
+      "bill_available": true
+    },
+    "specifications": {
+      "storage": "128GB"
+    },
+    "variants": [],
+    "source": "https://maniamobiles.com",
+    "scraped_at": "2026-10-17T00:00:00Z"
+  },
+  {
+    "product_name": "iPhone 16 256GB Black Color Open Box",
+    "product_url": "https://maniamobiles.com/product/iphone-16-256gb-black-color-open-box/",
+    "brand": "Apple",
+    "model": "iPhone 16",
+    "price_inr": 59999.0,
+    "regular_price_inr": 73999.0,
+    "currency": "INR",
+    "price_source": "official_product_page",
+    "price_needs_verification": true,
+    "stock_status": "out_of_stock",
+    "availability_source": "official product page; recheck before quoting",
+    "categories": [
+      "Mobiles",
+      "APPLE",
+      "IPHONE 16 SERIES",
+      "IPHONE 16",
+      "Device Category",
+      "Open Box"
+    ],
+    "image_urls": [],
+    "short_description": "iPhone 16, 256GB, Black, open-box listing.",
+    "description": "Official Mania Mobiles product listing. Page listed ₹59,999 against ₹73,999 regular price and showed out of stock when checked. This is an open-box listing, not a sealed-new guarantee. Verify current price, condition, warranty and stock with the store.",
+    "attributes": {
+      "storage": "256GB",
+      "color": "Black",
+      "condition": "Open Box",
+      "variant": "Indian"
+    },
+    "specifications": {
+      "storage": "256GB"
+    },
+    "variants": [],
+    "source": "https://maniamobiles.com",
+    "scraped_at": "2026-10-17T00:00:00Z"
+  },
+  {
+    "product_name": "iPhone 16 256GB Ultramarine Color",
+    "product_url": "https://maniamobiles.com/product/iphone-16-256gb-ultramarine-color/",
+    "brand": "Apple",
+    "model": "iPhone 16",
+    "price_inr": 59999.0,
+    "regular_price_inr": 70999.0,
+    "currency": "INR",
+    "price_source": "official_product_page",
+    "price_needs_verification": true,
+    "stock_status": "out_of_stock",
+    "availability_source": "official product page; recheck before quoting",
+    "categories": [
+      "Mobiles",
+      "APPLE",
+      "IPHONE 16 SERIES",
+      "IPHONE 16",
+      "Device Category"
+    ],
+    "image_urls": [],
+    "short_description": "iPhone 16, 256GB, Ultramarine listing.",
+    "description": "Official Mania Mobiles product listing. Page listed ₹59,999 against ₹70,999 regular price and showed out of stock when checked. The page contains inconsistent memory details in its descriptive attributes; verify exact storage and stock with the store.",
+    "attributes": {
+      "storage": "256GB",
+      "color": "Ultramarine",
+      "condition": "Superb",
+      "variant": "Indian"
+    },
+    "specifications": {
+      "storage": "256GB"
+    },
+    "variants": [],
+    "source": "https://maniamobiles.com",
+    "scraped_at": "2026-10-17T00:00:00Z"
+  },
+  {
+    "product_name": "iPhone 15 128GB Black Color",
+    "product_url": "https://maniamobiles.com/product/iphone-15-128gb-black-color-21/",
+    "brand": "Apple",
+    "model": "iPhone 15",
+    "price_inr": 44999.0,
+    "regular_price_inr": 60999.0,
+    "currency": "INR",
+    "price_source": "official_product_page",
+    "price_needs_verification": true,
+    "stock_status": "out_of_stock",
+    "availability_source": "official product page; recheck before quoting",
+    "categories": [
+      "Mobiles",
+      "APPLE",
+      "IPHONE 15 SERIES",
+      "IPHONE 15",
+      "Device Category"
+    ],
+    "image_urls": [],
+    "short_description": "iPhone 15, 128GB, Black listing.",
+    "description": "Official Mania Mobiles product listing. Page listed ₹44,999 against ₹60,999 regular price and showed out of stock when checked. Verify current price, condition, warranty and stock with the store.",
+    "attributes": {
+      "storage": "128GB",
+      "color": "Black",
+      "condition": "Superb",
+      "variant": "Indian",
+      "brand_box": true,
+      "bill_available": true
+    },
+    "specifications": {
+      "storage": "128GB"
+    },
+    "variants": [],
+    "source": "https://maniamobiles.com",
+    "scraped_at": "2026-10-17T00:00:00Z"
+  },
+  {
+    "product_name": "iPhone 17 256GB White Color Open Box",
+    "product_url": "https://maniamobiles.com/product/iphone-17-256gb-white-color-open-box/",
+    "sku": "358080223606013",
+    "brand": "Apple",
+    "model": "iPhone 17",
+    "price_inr": 77999.0,
+    "regular_price_inr": 89999.0,
+    "currency": "INR",
+    "price_source": "official_product_page",
+    "price_needs_verification": true,
+    "stock_status": "in_stock",
+    "availability_source": "official product page; recheck before quoting",
+    "categories": [
+      "Mobiles",
+      "APPLE",
+      "IPHONE 17 SERIES",
+      "IPHONE 17",
+      "Device Category",
+      "Open Box"
+    ],
+    "image_urls": [],
+    "short_description": "iPhone 17, 256GB, White, open-box listing.",
+    "description": "Official Mania Mobiles product page showed ₹77,999 against ₹89,999 regular price and reported one unit in stock when checked. This is open-box condition; verify current price, exact condition and stock with the store.",
+    "attributes": {
+      "storage": "256GB",
+      "color": "White",
+      "condition": "Superb-Just Open Box",
+      "variant": "Indian",
+      "brand_box": true,
+      "bill_available": true
+    },
+    "specifications": {
+      "storage": "256GB",
+      "warranty": "Brand warranty listed on page; verify current status"
+    },
+    "variants": [],
+    "source": "https://maniamobiles.com",
+    "scraped_at": "2026-10-17T00:00:00Z"
+  },
+  {
+    "product_name": "Google Pixel 9 Pro XL 128GB Obsidian Color",
+    "product_url": "https://maniamobiles.com/product/google-pixel-9-pro-xl-128gb-obsidian-color/",
+    "brand": "Google",
+    "model": "Pixel 9 Pro XL",
+    "price_inr": 76999.0,
+    "regular_price_inr": 89599.0,
+    "currency": "INR",
+    "price_source": "official_product_page",
+    "price_needs_verification": true,
+    "stock_status": "in_stock",
+    "availability_source": "official product page; recheck before quoting",
+    "categories": [
+      "Mobiles",
+      "GOOGLE",
+      "Device Category"
+    ],
+    "image_urls": [],
+    "short_description": "Google Pixel 9 Pro XL, 128GB, Obsidian, listed as Superb condition.",
+    "description": "Official Mania Mobiles product page listed ₹76,999 against ₹89,599 regular price and reported one unit in stock when checked. Page listed Global variant and no brand warranty; verify current stock, condition and warranty with the store.",
+    "attributes": {
+      "storage": "128GB",
+      "color": "Obsidian",
+      "condition": "Superb",
+      "variant": "Global",
+      "brand_warranty": false,
+      "brand_box": true,
+      "bill_available": false
+    },
+    "specifications": {
+      "storage": "128GB",
+      "battery_capacity": "5060mAh",
+      "warranty": "No brand warranty listed"
+    },
+    "variants": [],
+    "source": "https://maniamobiles.com",
+    "scraped_at": "2026-10-17T00:00:00Z"
+  },
+  {
+    "product_name": "iPhone 15 Plus 256GB Blue Color Sealed Cut",
+    "product_url": "https://maniamobiles.com/product/iphone-15-plus-256-blue-color-sealed-cut/",
+    "brand": "Apple",
+    "model": "iPhone 15 Plus",
+    "price_inr": 64999.0,
+    "regular_price_inr": 89000.0,
+    "currency": "INR",
+    "price_source": "official_product_page",
+    "price_needs_verification": true,
+    "stock_status": "out_of_stock",
+    "availability_source": "official product page; recheck before quoting",
+    "categories": [
+      "Mobiles",
+      "APPLE",
+      "IPHONE 15 SERIES",
+      "IPHONE 15 PLUS",
+      "Device Category",
+      "Sealed Cut"
+    ],
+    "image_urls": [],
+    "short_description": "iPhone 15 Plus, 256GB, Blue, sealed-cut listing.",
+    "description": "Official Mania Mobiles product page listed ₹64,999 against ₹89,000 regular price and showed out of stock when checked. Page lists Non Activated condition and Indian variant. Verify current price, condition, warranty and stock with the store.",
+    "attributes": {
+      "storage": "256GB",
+      "color": "Blue",
+      "condition": "Non Activated / Sealed Cut",
+      "variant": "Indian",
+      "brand_box": true,
+      "bill_available": true
+    },
+    "specifications": {
+      "storage": "256GB",
+      "warranty": "One-year warranty listed on page; verify current status"
+    },
+    "variants": [],
+    "source": "https://maniamobiles.com",
+    "scraped_at": "2026-10-17T00:00:00Z"
+  },
+  {
+    "product_name": "iPhone 16 128GB White Color Just Open Box",
+    "product_url": "https://maniamobiles.com/product/iphone-16-128gb-white-color-just-open-box-4/",
+    "brand": "Apple",
+    "model": "iPhone 16",
+    "price_inr": 66999.0,
+    "regular_price_inr": 70999.0,
+    "currency": "INR",
+    "price_source": "official_product_page",
+    "price_needs_verification": true,
+    "stock_status": "out_of_stock",
+    "availability_source": "official product page; recheck before quoting",
+    "categories": [
+      "Mobiles",
+      "APPLE",
+      "IPHONE 16 SERIES",
+      "IPHONE 16",
+      "Device Category",
+      "Open Box"
+    ],
+    "image_urls": [],
+    "short_description": "iPhone 16, 128GB, White, just-open-box listing.",
+    "description": "Official Mania Mobiles product page listed ₹66,999 against ₹70,999 regular price and showed out of stock when checked. Page describes Superb condition and a full kit. Verify current price, condition, warranty and stock with the store.",
+    "attributes": {
+      "storage": "128GB",
+      "color": "White",
+      "condition": "Just Open Box",
+      "variant": "Indian",
+      "brand_box": true,
+      "bill_available": true
+    },
+    "specifications": {
+      "storage": "128GB"
+    },
+    "variants": [],
+    "source": "https://maniamobiles.com",
+    "scraped_at": "2026-10-17T00:00:00Z"
+  },
+  {
+    "product_name": "iPhone 14 Pro Max 256GB Deep Purple Color",
+    "product_url": "https://maniamobiles.com/product/iphone-14-pro-max-256gb-deep-purple-10/",
+    "brand": "Apple",
+    "model": "iPhone 14 Pro Max",
+    "price_inr": 54999.0,
+    "regular_price_inr": 79000.0,
+    "currency": "INR",
+    "price_source": "official_product_page",
+    "price_needs_verification": true,
+    "stock_status": "out_of_stock",
+    "availability_source": "official product page; recheck before quoting",
+    "categories": [
+      "Mobiles",
+      "APPLE",
+      "IPHONE 14 SERIES",
+      "IPHONE 14 PRO MAX",
+      "Device Category"
+    ],
+    "image_urls": [],
+    "short_description": "iPhone 14 Pro Max, 256GB, Deep Purple listing.",
+    "description": "Official Mania Mobiles product page listed ₹54,999 against ₹79,000 regular price and showed out of stock when checked. Page lists expired warranty/no brand warranty; verify current condition, price and stock with the store.",
+    "attributes": {
+      "storage": "256GB",
+      "color": "Deep Purple",
+      "condition": "Superb",
+      "variant": "Indian",
+      "brand_warranty": false,
+      "brand_box": true,
+      "bill_available": true
+    },
+    "specifications": {
+      "storage": "256GB",
+      "warranty": "Expired / no brand warranty listed"
+    },
+    "variants": [],
+    "source": "https://maniamobiles.com",
+    "scraped_at": "2026-10-17T00:00:00Z"
   }
 ]
