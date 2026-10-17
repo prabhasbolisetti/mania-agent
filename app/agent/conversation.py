@@ -3376,6 +3376,17 @@ def _begin_new_cycle_after_completed_lead(session: dict, customer_id: str) -> No
     })
 
 
+def _has_any(text: str, phrases) -> bool:
+    """Return True when any non-empty phrase occurs in text, case-insensitively."""
+    normalized_text = (text or "").casefold()
+    return any(
+        isinstance(phrase, str)
+        and phrase.strip()
+        and phrase.casefold() in normalized_text
+        for phrase in (phrases or ())
+    )
+
+
 def _is_clear_intent_response(message: str) -> bool:
     text = (message or "").strip().lower()
     if text in {
