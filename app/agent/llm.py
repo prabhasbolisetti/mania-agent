@@ -3444,6 +3444,21 @@ def generate_response(
     if language not in {"english", "telugu", "roman_telugu"}:
         language = "roman_telugu"
 
+    # Response rewriting is optional because the conversation layer already
+    # constructs the business decision and draft. By default, keep that draft
+    # and use deterministic localization to avoid an extra paid model request
+    # for every customer message. Set LLM_RESPONSE_REWRITE_ENABLED=true to
+    # restore model-assisted wording without changing the public API.
+    rewrite_enabled = os.getenv(
+        "LLM_RESPONSE_REWRITE_ENABLED", "false"
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if not rewrite_enabled:
+        return _localized_fallback(
+            draft_response=draft_response,
+            language=language,
+            customer=customer,
+        )
+
     prompt = build_customer_response_prompt(
         customer_message=customer_message,
         draft_response=draft_response,

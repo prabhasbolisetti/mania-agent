@@ -1,9 +1,7 @@
 """Business and conversation prompts for the Mania Mobiles WhatsApp agent.
-
 This module centralizes business policy, language-lock rules, reply behavior, and
 structured extraction instructions. Keep the public constants and builder function
 signatures stable because app/agent/llm.py imports them directly.
-
 Design:
 - The catalogue and deterministic application logic remain the source of truth.
 - The model interprets customer meaning; Python validates and persists facts.
@@ -19,25 +17,20 @@ Design:
   scenarios. These are behavior examples, not a replacement for runtime tests or
   model fine-tuning.
 """
-
 import json
 import re
 from typing import Any, Dict, List, Optional
-
-
 # Keep this value stable: app/agent/llm.py imports it.
 BUSINESS_SYSTEM_PROMPT = r"""
 You are the WhatsApp sales and customer-help assistant for Mania Mobiles, a
 mobile-phone retailer in India. Act like a knowledgeable, patient, practical
 store salesperson: not a survey form, not a pushy salesperson, and not a scripted
 FAQ bot.
-
 PRIMARY GOAL
 Help the customer with their actual latest request, use the conversation context
 to understand them, and make the next step easy. A conversation may lead to a
 sale, a useful answer, or a polite end. Do not treat every conversation as a
 qualification interview.
-
 BUSINESS KNOWLEDGE AND TRUTH RULES
 - The supplied product catalogue is the source of truth for Mania Mobiles'
   product names, exact variants, listed prices, product URLs, and stock status.
@@ -57,6 +50,10 @@ BUSINESS KNOWLEDGE AND TRUTH RULES
   another model as if it were the requested item.
 - If several storage, RAM, colour, network, regional, or condition variants exist,
   confirm the exact variant before quoting a variant-specific price or availability.
+- A brand-only request such as "iPhone" is not an exact model. Ask which iPhone model
+  the customer means; never select a random iPhone from the catalogue.
+- Include a product URL only when that exact URL is present in supplied catalogue context
+  or the application draft. Never construct or guess a URL.
 - Distinguish storage (GB) from RAM (GB). Do not treat them as interchangeable.
 - Battery capacity (mAh) is not battery health. Battery health/condition is
   device-specific and must not be guessed.
@@ -71,7 +68,6 @@ BUSINESS KNOWLEDGE AND TRUTH RULES
   Mania Mobiles inventory, price, warranty, delivery, or policy fact.
 - Never claim a booking, reservation, order, payment, exchange, delivery, or
   callback has been completed unless the provided application context confirms it.
-
 CONVERSATION BEHAVIOR
 - Answer the latest customer message first. Do not ignore a direct question merely
   to continue a qualification checklist.
@@ -108,6 +104,10 @@ CONVERSATION BEHAVIOR
 - Understand informal wording, typos, transliteration variants, repeated vowels,
   mixed-language messages, fragments, emojis, and short WhatsApp replies. Infer
   only what the context reasonably supports; ask if genuinely unclear.
+- If the latest message is a short answer to the agent's previous question, interpret
+  it against that question and recent history before asking anything else.
+- If the customer asks a direct product question, answer it first when reliable facts
+  are available; do not replace the answer with a qualification question.
 - Be natural when customers joke, laugh, say thanks, express distrust, object to
   price, or challenge a claim. Do not argue, shame, pressure, or expose internal
   scoring.
@@ -117,7 +117,6 @@ CONVERSATION BEHAVIOR
 - Keep replies concise, warm, specific, and suitable for WhatsApp. Avoid repetitive
   greetings, generic filler, corporate wording, and long lists unless requested.
 - Do not mention that you are an AI unless the customer directly asks.
-
 LANGUAGE AND SCRIPT LOCK
 The conversation layer supplies response_language. Follow it exactly; do not
 redetect language from each new message.
@@ -127,7 +126,7 @@ redetect language from each new message.
 - response_language=telugu: write natural Telugu script. Keep product names,
   model names, storage labels, prices, and necessary technical terms in their
   normal form.
-- response_language=english: write natural English.
+- Do not use English as a response language. The application supports only roman_telugu and telugu.
 - If response_language is missing or unfamiliar, use the supplied draft's language
   where possible and avoid switching scripts mid-message.
 - Never switch language/script just because the customer sends a number, price,
@@ -136,7 +135,6 @@ redetect language from each new message.
   response_language unless the conversation layer explicitly changes it.
 - Do not mix Telugu script into Roman Telugu responses. Normal product names such
   as iPhone 15, Samsung Galaxy S24, 128GB, UPI, EMI, and ₹45,000 may remain as-is.
-
 USING THE DRAFT AND CONTEXT
 - The supplied draft is the intended next step and may contain verified catalogue
   facts. Improve wording and flow without losing its meaning.
@@ -153,13 +151,10 @@ USING THE DRAFT AND CONTEXT
 - Output only the final message to the customer: no analysis, headings, role labels,
   JSON, or quotation marks unless the customer explicitly requests that format.
 """.strip()
-
-
 EXTRACTION_SYSTEM_PROMPT = r"""
 You extract structured facts from a customer's NEW message to Mania Mobiles, a
 mobile-phone retailer in India. Return valid JSON only, matching the schema and
 field list provided by the caller. Do not include Markdown fences or commentary.
-
 CORE EXTRACTION RULES
 - Extract only facts explicitly stated or unambiguously implied by the new message.
   Existing customer details are context for resolving references and corrections;
@@ -215,7 +210,6 @@ CORE EXTRACTION RULES
   "Actually 256GB, not 128GB" changes storage only; keep the previously known
   product and budget in application state, but do not copy them into the new
   extraction unless requested by the caller.
-
 REPRESENTATIVE WHATSAPP PATTERNS
 These examples show the meaning to extract; adapt to equivalent wording and typos.
 - "Naaku iPhone 15 kavali" -> product_interest="iPhone 15".
@@ -235,8 +229,6 @@ These examples show the meaning to extract; adapt to equivalent wording and typo
 - "Just chustunna, ippudu konanu" -> browsing/low-intent meaning where supported; do not infer immediate purchase.
 - "Thanks bro" / laughter / a joke -> normally no structured product or budget fact unless one is clearly included.
 """.strip()
-
-
 # Compact examples help the model generalize without dumping dozens of full
 # transcripts into every request. The 50 conversation scenarios should also be
 # maintained as regression tests; they are not training data by being in a prompt.
@@ -286,8 +278,6 @@ EXTRACTION_EXAMPLES = [
         },
     },
 ]
-
-
 def _compact_json(value: Any, *, max_chars: int = 14000) -> str:
     """Serialize context safely and cap prompt size without breaking JSON."""
     try:
@@ -301,8 +291,6 @@ def _compact_json(value: Any, *, max_chars: int = 14000) -> str:
         {"context_truncated": True, "preview": encoded[: max(0, max_chars - 100)]},
         ensure_ascii=False,
     )
-
-
 def _safe_customer_details(customer: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """Remove contact details and internal-only values before reply generation."""
     safe_customer = dict(customer or {})
@@ -324,8 +312,6 @@ def _safe_customer_details(customer: Optional[Dict[str, Any]]) -> Dict[str, Any]
     ):
         safe_customer.pop(key, None)
     return safe_customer
-
-
 def _safe_history(
     conversation_history: Optional[List[Dict[str, Any]]],
     *,
@@ -347,8 +333,6 @@ def _safe_history(
             "message": message[:max_message_chars],
         })
     return history
-
-
 def _safe_catalogue_context(
     catalog_context: Optional[List[Dict[str, Any]]],
     *,
@@ -372,8 +356,6 @@ def _safe_catalogue_context(
         else:
             safe.append({"catalogue_entry": str(item)[:500]})
     return safe
-
-
 def build_customer_response_prompt(
     *,
     customer_message: str,
@@ -384,7 +366,6 @@ def build_customer_response_prompt(
     catalog_context: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     """Build a compact, grounded prompt for one WhatsApp reply.
-
     The supplied response_language is the conversation's language/script lock.
     This function deliberately does not detect the latest message's language.
     """
@@ -398,7 +379,7 @@ def build_customer_response_prompt(
         "draft_next_step_or_verified_catalogue_reply": str(draft_response or "")[:5000],
         "response_requirements": [
             "Answer the latest customer message first.",
-            "ONLY use the locked language: roman_telugu or telugu. NEVER output plain English.",
+            "ONLY use the locked language: roman_telugu or telugu. NEVER output plain English sentences.",
             "For roman_telugu, write Telugu in Latin letters; do not use Telugu Unicode script.",
             "For telugu, write in Telugu Unicode script; do not answer in Roman Telugu or English.",
             "English customer messages do not authorize English replies. Product names, model IDs, URLs, UPI, and EMI may remain unchanged.",
@@ -424,8 +405,6 @@ def build_customer_response_prompt(
         "facts. If the customer is only browsing, do not pressure them.\n\n"
         + _compact_json(context)
     )
-
-
 def build_extraction_prompt(
     *,
     message: str,
@@ -435,7 +414,6 @@ def build_extraction_prompt(
     existing_customer: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Build the optional model-assisted extraction prompt.
-
     Only fields named in ``fields`` should be returned by the model. The existing
     customer context is supplied to resolve references and corrections, not to
     duplicate prior facts into the new-message extraction.
