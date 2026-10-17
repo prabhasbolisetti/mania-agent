@@ -95,6 +95,7 @@ FIELD_ORDER = [
     "product_interest",
     "budget",
     "storage",
+    "purchase_timeline",
     "condition",
     "location",
 ]
@@ -107,6 +108,7 @@ RESTORE_FIELD_ORDER = [
     "product_interest",
     "budget",
     "storage",
+    "purchase_timeline",
     "condition",
     "location",
 ]
@@ -2433,6 +2435,73 @@ def _localized_question(field: str, language: str, customer: dict) -> str:
 
     return templates.get(field, "")
 
+def _parse_explicit_budget_amount(message: str, asked_field: str = ""):
+    """Parse common Indian budget expressions without confusing storage with money.
+
+    Supports ₹1.25 lakh, 1.25 lac/lakh/lakhs, 1 lakh 25 thousand, 125k,
+    ₹1,25,000, 125000, and bare numbers only while the budget field is active.
+    """
+    text = (message or "").lower().replace("₹", " rs ")
+    text = re.sub(r"\s+", " ", text).strip()
+    budget_context = bool(re.search(
+        r"\b(?:budget|rs\.?|rupees?|inr|under|below|around|approx(?:imately)?|lakh|lakhs|lac|lacs|lakh[s]?|thousand|koti|naa budget|na budget|lopu|varaku)\b",
+        text,
+    )) or " rs " in f" {text} "
+    bare_amount = asked_field == "budget" and bool(re.fullmatch(r"[\d,]+(?:\.\d+)?\s*(?:k|l|lac|lacs|lakh|lakhs)?", text))
+    if not budget_context and not bare_amount:
+        return None
+    # Storage-only answers are never budgets, even when storage is the active field.
+    if re.fullmatch(r"(?:64|128|256|512|1024)\s*(?:gb|tb)?", text):
+        return None
+    # Indian shorthand: 1 lakh 25 thousand.
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(?:lakh|lakhs|lac|lacs|l)\s*(?:(\d+(?:\.\d+)?)\s*(?:thousand|k))?", text)
+    if m:
+        value = float(m.group(1)) * 100000
+        if m.group(2):
+            value += float(m.group(2)) * 1000
+        return int(value) if 1000 <= value <= 10000000 else None
+    m = re.search(r"(?<![a-z])(?:rs\s*)?([\d,]+(?:\.\d+)?)\s*(k|thousand)\b", text)
+    if m:
+        value = float(m.group(1).replace(",", "")) * 1000
+        return int(value) if 1000 <= value <= 10000000 else None
+    # Numeric amount, including Indian comma grouping.
+    m = re.search(r"(?:rs\s*)?([\d,]+(?:\.\d+)?)", text)
+    if not m:
+        return None
+    value = float(m.group(1).replace(",", ""))
+    if value in {64, 128, 256, 512, 1024} and not re.search(r"\b(?:budget|rs|rupees|inr)\b", text):
+        return None
+    return int(value) if 1000 <= value <= 10000000 else None
+
+
+MANIA_STORE_ADDRESS = "Beside MGB Mall, Nellore, Andhra Pradesh"
+MANIA_STORE_MAPS_URL = "https://www.google.com/maps/search/?api=1&query=Beside+MGB+Mall%2C+Nellore%2C+Andhra+Pradesh"
+
+
+def _store_faq_reply(message: str, language: str) -> Optional[str]:
+    """Grounded answers for store policies that are explicitly provided by the business."""
+    text = (message or "").casefold()
+    asks_emi = any(x in text for x in ("emi", "installment", "instalment", "ఈఎంఐ", "వాయిదా"))
+    asks_exchange = any(x in text for x in ("exchange", "trade in", "trade-in", "పాత ఫోన్", "ఎక్స్చేంజ్"))
+    if not asks_emi and not asks_exchange:
+        return None
+    if language == "telugu":
+        parts = []
+        if asks_emi:
+            parts.append("EMI సదుపాయం నెల్లూరు మరియు పరిసర ప్రాంతాల్లో మాత్రమే అందుబాటులో ఉంటుంది. అర్హత, బ్యాంక్ ఆఫర్లు, ప్రస్తుత నిబంధనలను స్టోర్‌లో నిర్ధారించాలి.")
+        if asks_exchange:
+            parts.append("ఎక్స్చేంజ్ విలువ పాత ఫోన్ మోడల్, స్టోరేజ్, కండిషన్‌పై ఆధారపడి ఉంటుంది. మీ పాత ఫోన్ మోడల్, స్టోరేజ్ వివరాలు చెప్పండి; ఖచ్చితమైన విలువ కోసం స్టోర్‌ను సందర్శించండి.")
+        parts.append(f"స్టోర్: {MANIA_STORE_ADDRESS}. Google Maps: {MANIA_STORE_MAPS_URL}")
+        return "\n\n".join(parts)
+    parts = []
+    if asks_emi:
+        parts.append("EMI may be available in Nellore and surrounding areas only. Please confirm current eligibility, bank offers and terms with the store; I can't guarantee approval here.")
+    if asks_exchange:
+        parts.append("Exchange value depends on your old phone's exact model, storage and condition. Tell me your current phone model and storage, and visit the store for the final exchange valuation.")
+    parts.append(f"Store: {MANIA_STORE_ADDRESS}. Google Maps: {MANIA_STORE_MAPS_URL}")
+    return "\n\n".join(parts)
+
+
 def _process_message_impl(
 
     customer_id: str,
@@ -2658,8 +2727,12 @@ def _process_message_impl(
     # Only accept a budget when the customer explicitly states a currency/amount
     # or budget language, or when a realistic bare amount answers a budget prompt.
     message_lower = (message or "").lower()
+    parsed_budget = _parse_explicit_budget_amount(message, session.get("asked_field", ""))
+    if parsed_budget is not None:
+        extracted["budget"] = parsed_budget
+        extracted["budget_amount"] = parsed_budget
     explicit_budget_context = bool(re.search(
-        r"(?:₹|\brs\.?\b|\brupees?\b|\bbudget\b|\bunder\b|\bbelow\b|\baround\b|\bapprox(?:imately)?\b|\blopu\b|\bvaraku\b|\bnaa budget\b|\bna budget\b)",
+        r"(?:₹|\brs\.?\b|\brupees?\b|\bbudget\b|\bunder\b|\bbelow\b|\baround\b|\bapprox(?:imately)?\b|\blopu\b|\bvaraku\b|\bnaa budget\b|\bna budget\b|\blakh(?:s)?\b|\blac(?:s)?\b|\bthousand\b)",
         message_lower,
     )) or bool(
         session.get("asked_field") == "budget"
@@ -2794,6 +2867,32 @@ def _process_message_impl(
 
     if repair_message:
         repair_reply = _context_repair_reply(active_language, customer, session)
+        # A correction/repetition complaint is business-contextual: give the
+        # configured LLM one chance to understand the customer's actual message
+        # rather than returning a stale field question again. The deterministic
+        # repair remains the safe fallback if no provider is configured/fails.
+        try:
+            repair_reply = generate_response(
+                draft_response=repair_reply,
+                customer_message=message,
+                language=active_language,
+                customer=customer,
+                conversation_history=session.get("conversation_history", [])[-8:],
+                catalog_context=[],
+                force_llm=True,
+            ) or repair_reply
+        except TypeError:
+            # Compatibility with older llm.py files that don't yet accept force_llm.
+            repair_reply = generate_response(
+                draft_response=repair_reply,
+                customer_message=message,
+                language=active_language,
+                customer=customer,
+                conversation_history=session.get("conversation_history", [])[-8:],
+                catalog_context=[],
+            ) or repair_reply
+        except Exception as exc:
+            print("Context-repair LLM fallback failed:", type(exc).__name__)
         return {
             "customer_id": customer_id, "message": repair_reply, "customer": customer,
             "qualification": session.get("qualification"), "intent": session.get("intent"),
@@ -3804,7 +3903,7 @@ def _has_business_context(session: dict) -> bool:
 
 
 def _context_repair_reply(language: str, customer: dict, session: dict) -> str:
-    """Answer context/complaint messages without calling an LLM."""
+    """Create a safe deterministic fallback for context/complaint messages."""
     product = str(customer.get("model") or customer.get("product_interest") or "").strip()
     brand = str(customer.get("brand") or "").strip()
     storage = str(customer.get("storage") or "").strip()
@@ -4040,7 +4139,22 @@ def _process_message_serialized(customer_id: str, message: str) -> dict:
 
     previous_history_len = len(session.get("conversation_history", []))
 
-    if is_greeting:
+    # Store FAQ handling must run even after a completed lead has been reset.
+    # These are known business policies; don't route them to the greeting fallback.
+    faq_language = _resolve_response_language(message, session)
+    faq_reply = _store_faq_reply(message, faq_language)
+    if faq_reply:
+        result = {
+            "customer_id": customer_id,
+            "message": faq_reply,
+            "customer": session.get("customer", {}),
+            "qualification": session.get("qualification"),
+            "intent": session.get("intent"),
+            "intent_history": session.get("intent_history", []),
+            "lead_id": session.get("lead_id"),
+            "lead_saved": bool(session.get("lead_saved")),
+        }
+    elif is_greeting:
         language = _resolve_response_language(message, session)
         next_missing_field = next(
             (field for field in FIELD_ORDER if not _field_is_complete(field, session.get("customer", {}))),

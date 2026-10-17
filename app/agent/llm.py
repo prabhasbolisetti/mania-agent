@@ -3426,6 +3426,7 @@ def generate_response(
     customer: Optional[dict] = None,
     conversation_history: Optional[list] = None,
     catalog_context: Optional[list] = None,
+    force_llm: bool = False,
 ) -> str:
     """Generate a grounded, context-aware WhatsApp reply when an API is configured.
 
@@ -3452,7 +3453,23 @@ def generate_response(
     rewrite_enabled = os.getenv(
         "LLM_RESPONSE_REWRITE_ENABLED", "false"
     ).strip().lower() in {"1", "true", "yes", "on"}
-    if not rewrite_enabled:
+    # Even when rewriting every normal response is disabled, invoke the model
+    # for a business-related fallback that indicates the deterministic handler
+    # did not understand the customer. The model receives the locked language,
+    # known customer fields, history and catalogue context; it must not invent
+    # prices/stock/policies that are absent from that context.
+    draft_lower = draft_response.casefold()
+    fallback_markers = (
+        "didn't understand", "did not understand", "couldn't understand",
+        "could not understand", "sarigga connect cheyyaledu",
+        "mee message ni context tho", "mee message ni sarigga",
+        "what would you like to know about the phone", "which mobile model are we discussing",
+        "ye mobile model gurinchi matladuthunnamo", "ye mobile model gurinchi matladutunnamo",
+        "meeku ye mobile kavali? brand mariyu model peru cheppandi",
+        "మీ మాటను సరిగా అర్థం చేసుకోలేదు",
+    )
+    fallback_needs_llm = any(marker in draft_lower for marker in fallback_markers)
+    if not rewrite_enabled and not fallback_needs_llm and not force_llm:
         return _localized_fallback(
             draft_response=draft_response,
             language=language,
