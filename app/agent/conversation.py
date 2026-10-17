@@ -231,9 +231,11 @@ def _is_brand_only(value: Any) -> bool:
     }
 
 
-def _field_is_complete(field: str, customer: dict) -> bool:
+def _field_is_complete(field: str, customer: dict, session: Optional[dict] = None) -> bool:
 
     value = customer.get(field)
+    if field == "storage" and session and session.get("catalog_variant_unresolved"):
+        return False
 
     # A brand by itself is not an exact phone variant. Keep asking for the model
     # until the customer chooses one, unless they explicitly want recommendations.
@@ -782,8 +784,9 @@ def _catalog_model_options_message(model: str, language: str, storage: str = "")
 
 
 def _catalog_options_only_message(model: str, language: str, storage: str = "", color: str = "") -> str:
-    """Show only catalogue-backed variants for a model; leave questions to the flow layer."""
+    """Show catalog-backed options; hide URLs until the customer selects storage."""
     telugu = language == "telugu"
+    include_links = bool(str(storage or "").strip())
     items = _catalog_products_for_model(model, storage=storage, color=color)
     if not items:
         if telugu:
@@ -801,7 +804,7 @@ def _catalog_options_only_message(model: str, language: str, storage: str = "", 
         details = " / ".join(part for part in (storage_label, color_label) if part)
         label = f"{name} ({details})" if details else name
         line = f"• {label} — {price}; {stock}"
-        if url.startswith(("https://", "http://")):
+        if include_links and url.startswith(("https://", "http://")):
             line += f"\n  {url}"
         if line not in seen:
             seen.add(line)
@@ -837,6 +840,8 @@ def _get_product_message(
         model = re.sub(r"\b\d{1,4}\s*(?:gb|tb)\b", "", product_interest, flags=re.I).strip()
         storage_match = re.search(r"\b(64|128|256|512|1024)\s*(gb|tb)\b", product_interest, re.I)
         color_match = re.search(r"\b(black|white|blue|pink|green|teal|ultramarine|yellow|purple|natural|titanium|silver|gold|midnight|starlight|graphite|desert|sierra|red)\b", product_interest, re.I)
+        model = re.sub(r"\b(black|white|blue|pink|green|teal|ultramarine|yellow|purple|natural|titanium|silver|gold|midnight|starlight|graphite|desert|sierra|red)\b", "", model, flags=re.I)
+        model = re.sub(r"\s+", " ", model).strip()
         exact = _catalog_products_for_model(
             model,
             storage=(f"{storage_match.group(1)}{storage_match.group(2)}" if storage_match else ""),
@@ -2770,6 +2775,36 @@ def _process_message_impl(
 
     )
 
+    # If the customer is choosing an alternative after an unavailable exact
+    # combination, resume the normal flow only when their choice exists in the
+    # catalog. This state lives in the session, not in the persisted lead fields.
+    if session.get("catalog_variant_unresolved"):
+        selected_model = str(customer.get("model") or customer.get("product_interest") or "").strip()
+        selected_model = re.sub(r"\b\d{1,4}\s*(?:gb|tb)\b", "", selected_model, flags=re.I)
+        selected_model = re.sub(r"\b(black|white|blue|pink|green|teal|ultramarine|yellow|purple|natural|titanium|silver|gold|midnight|starlight|graphite|desert|sierra|red)\b", "", selected_model, flags=re.I)
+        selected_model = re.sub(r"\s+", " ", selected_model).strip()
+        selected_storage = str(customer.get("storage") or "")
+        selected_color = str(customer.get("color") or "")
+        try:
+            selected_options = _catalog_products_for_model(
+                selected_model, storage=selected_storage, color=selected_color
+            )
+            # If the customer chose a new storage/color from the alternatives,
+            # discard the stale part of the unavailable combination when it
+            # prevents an otherwise valid catalog match.
+            if not selected_options and extracted.get("storage") and not extracted.get("color"):
+                selected_options = _catalog_products_for_model(selected_model, storage=selected_storage)
+                if selected_options:
+                    customer.pop("color", None)
+            if not selected_options and extracted.get("color") and not extracted.get("storage"):
+                selected_options = _catalog_products_for_model(selected_model, color=selected_color)
+                if selected_options:
+                    customer.pop("storage", None)
+        except Exception:
+            selected_options = []
+        if selected_options:
+            session.pop("catalog_variant_unresolved", None)
+
     # ---------------------------------------------------------
 
     # INTENT
@@ -2978,48 +3013,60 @@ def _process_message_impl(
 
     )
 
-    current_product = str(customer.get("product_interest") or extracted_product or "").strip()
-    # Storage may already be embedded in the extracted product name; avoid
-    # duplicating it when constructing the exact catalogue variant query.
-    current_product = re.sub(r"\b\d{1,4}\s*(?:gb|tb)\b", "", current_product, flags=re.I).strip()
+    current_product = str(customer.get("model") or customer.get("product_interest") or extracted_product or "").strip()
+    # The extracted interest can contain the selected storage/color. Normalize to
+    # the base model before querying the catalog; retain the selections separately.
+    current_product = re.sub(r"\b\d{1,4}\s*(?:gb|tb)\b", "", current_product, flags=re.I)
+    current_product = re.sub(r"\b(black|white|blue|pink|green|teal|ultramarine|yellow|purple|natural|titanium|silver|gold|midnight|starlight|graphite|desert|sierra|red)\b", "", current_product, flags=re.I)
+    current_product = re.sub(r"\s+", " ", current_product).strip()
     current_storage = str(customer.get("storage") or "").strip()
-    variant_key = f"{current_product} {current_storage}".strip()
+    current_color = str(customer.get("color") or "").strip()
+    variant_key = f"{current_product} {current_storage} {current_color}".strip()
     product_named_now = bool(
         _is_specific_model_name(current_product)
         and _is_specific_product_mentioned(message, current_product)
     )
-    current_color = str(customer.get("color") or "").strip()
-    variant_key = f"{current_product} {current_storage} {current_color}".strip()
     variant_supplied_now = bool(extracted.get("storage") or extracted.get("color")) and bool(current_product)
     variant_is_complete = bool(current_product and current_storage)
     variants_for_storage = _catalog_products_for_model(current_product, storage=current_storage) if current_product and current_storage else []
     colors_for_storage = {_catalog_color(item) for item in variants_for_storage if _catalog_color(item)}
     color_resolved = bool(current_color) or len(colors_for_storage) <= 1
-    if _is_specific_model_name(current_product) and (product_named_now or variant_supplied_now):
+    if _is_specific_model_name(current_product) and (product_named_now or variant_supplied_now or session.get("catalog_variant_unresolved")):
         if variant_is_complete and color_resolved:
-            # A single URL is safe only when the exact model/storage/color resolves uniquely.
+            # A direct product URL is returned only for a unique exact model,
+            # storage, and color match. Never substitute a nearby variant.
             exact_matches = _catalog_products_for_model(
                 current_product, storage=current_storage, color=current_color
             )
             if len(exact_matches) == 1:
                 product_message = _get_product_message(variant_key, variant_key, active_language)
                 session["catalog_product"] = variant_key if product_message else None
+                session.pop("catalog_variant_unresolved", None)
             elif len(exact_matches) > 1:
                 product_message = _catalog_options_only_message(
                     current_product, active_language, storage=current_storage, color=current_color
                 )
                 session["catalog_product"] = None
+                session["catalog_variant_unresolved"] = True
+            else:
+                # Requested combination is absent: show available alternatives
+                # without links and ask the customer to select a listed variant.
+                product_message = _catalog_options_only_message(current_product, active_language)
+                session["catalog_product"] = None
+                session["catalog_variant_unresolved"] = True
         else:
-            # On the first model mention, show real storage/color options and prices,
-            # then ask for the budget in parallel instead of forcing a serial checklist.
+            # Model only: show catalog variants/colors without URLs. After a
+            # storage choice, show matching product URLs; ask for any missing color.
             product_message = _catalog_options_only_message(
                 current_product, active_language, storage=current_storage, color=current_color
             )
             session["catalog_product"] = None
+            if not current_storage or (current_storage and not variants_for_storage):
+                session.pop("catalog_variant_unresolved", None)
         session["catalog_message_sent"] = bool(product_message)
 
     all_qualification_fields_complete = all(
-        _field_is_complete(field, customer) for field in FIELD_ORDER
+        _field_is_complete(field, customer, session) for field in FIELD_ORDER
     )
     answering_intent_question = bool(
         session.get("intent_question_asked") and all_qualification_fields_complete
@@ -3076,6 +3123,8 @@ def _process_message_impl(
 
                 customer,
 
+                session,
+
             )
 
         ),
@@ -3113,7 +3162,12 @@ def _process_message_impl(
             )
 
         if product_message and next_field == "budget" and _is_specific_model_name(current_product):
-            if current_storage and not current_color:
+            if session.get("catalog_variant_unresolved"):
+                if active_language == "telugu":
+                    combined_question = "పైన ఉన్న కాటలాగ్ ఆప్షన్లలో సరిపోయే వేరియంట్‌ను ఎంచుకోండి. మీ బడ్జెట్ ఎంత అనుకుంటున్నారు?"
+                else:
+                    combined_question = "Paina unna catalog options lo meeku set ayye variant ni select cheyyandi. Mee budget entha anukuntunnaru?"
+            elif current_storage and not current_color:
                 if active_language == "telugu":
                     combined_question = "మీకు ఏ కలర్ కావాలి? మీ బడ్జెట్ ఎంత అనుకుంటున్నారు?"
                 else:
@@ -3131,10 +3185,26 @@ def _process_message_impl(
                 combined_question = "Ye storage, color kavali? Mee budget entha anukuntunnaru?"
             message_parts.append(combined_question)
         elif product_message and next_field == "storage" and _is_specific_model_name(current_product):
-            if active_language == "telugu":
-                message_parts.append("మీకు ఏ స్టోరేజ్, కలర్ వేరియంట్ కావాలి?")
+            if session.get("catalog_variant_unresolved"):
+                if active_language == "telugu":
+                    message_parts.append("పైన ఉన్న కాటలాగ్ ఆప్షన్లలో మీకు సరిపోయే స్టోరేజ్, కలర్ వేరియంట్‌ను ఎంచుకోండి.")
+                else:
+                    message_parts.append("Paina unna catalog options lo meeku kavalsina storage, color variant ni select cheyyandi.")
+            elif current_storage and not current_color:
+                if active_language == "telugu":
+                    message_parts.append("ఈ స్టోరేజ్‌లో మీకు ఏ కలర్ కావాలి?")
+                else:
+                    message_parts.append("Ee storage lo ye color kavali?")
+            elif current_color and not current_storage:
+                if active_language == "telugu":
+                    message_parts.append("మీకు ఏ స్టోరేజ్ వేరియంట్ కావాలి?")
+                else:
+                    message_parts.append("Ye storage variant kavali?")
             else:
-                message_parts.append("Ye storage, color variant kavali?")
+                if active_language == "telugu":
+                    message_parts.append("మీకు ఏ స్టోరేజ్, కలర్ వేరియంట్ కావాలి?")
+                else:
+                    message_parts.append("Ye storage, color variant kavali?")
         else:
             message_parts.append(_localized_question(next_field, active_language, customer))
 
@@ -3927,7 +3997,7 @@ def _context_repair_reply(language: str, customer: dict, session: dict) -> str:
                 details += f", బడ్జెట్ {budget_text}"
             if not _is_specific_model_name(product):
                 return f"క్షమించండి 😊 మీరు {details} అని చెప్పారు. బ్రాండ్/స్టోరేజ్ అర్థమైంది, కానీ ఖచ్చితమైన మోడల్ ఇంకా ఎంచుకోలేదు. ఏ మోడల్ కావాలి? తెలియకపోతే మీ బడ్జెట్‌కు సరిపోయే మోడల్స్ సూచిస్తాను."
-            next_field = next((field for field in FIELD_ORDER if not _field_is_complete(field, customer)), None)
+            next_field = next((field for field in FIELD_ORDER if not _field_is_complete(field, customer, session)), None)
             if next_field:
                 return f"క్షమించండి 😊 మీరు {details} అని చెప్పారు; ఆ వివరాలు గుర్తున్నాయి. " + _localized_question(next_field, language, customer)
             return f"క్షమించండి 😊 మీరు {details} గురించి అడుగుతున్నారు. ధర/స్టాక్‌ను నిర్ధారించి సహాయం చేస్తాను."
@@ -3941,7 +4011,7 @@ def _context_repair_reply(language: str, customer: dict, session: dict) -> str:
             details += f", budget {budget_text}"
         if not _is_specific_model_name(product):
             return f"Sorry bro 😊 Meeru {details} ani chepparu. Brand/storage ardham ayyayi, kani exact model inka select cheyyaledu. Ye model kavali? Teliyakapotey mee budget ki set ayye models suggest chestha."
-        next_field = next((field for field in FIELD_ORDER if not _field_is_complete(field, customer)), None)
+        next_field = next((field for field in FIELD_ORDER if not _field_is_complete(field, customer, session)), None)
         if next_field:
             return f"Sorry bro 😊 Meeru {details} ani chepparu; aa details gurthunnayi. " + _localized_question(next_field, language, customer)
         return f"Sorry bro 😊 Meeru {details} gurinchi adugutunnaru. Price/stock verify chesi help chestha."
@@ -4029,11 +4099,12 @@ def _is_business_related_message(message: str, session: dict) -> bool:
     return any(term in text for term in business_terms)
 
 def _out_of_scope_reply(language: str) -> str:
+    """Keep unrelated requests out of the sales flow; don't restart the greeting."""
     if language == "telugu":
-        return "క్షమించండి 😊 Mania Mobiles‌కు సంబంధించిన మొబైల్ ధరలు, స్టాక్, ఫీచర్లు, EMI, ఎక్స్చేంజ్, కొనుగోలు వివరాల్లో సహాయం చేయగలను. మీ ప్రశ్నను కొంచెం వివరంగా చెప్పండి."
+        return "క్షమించండి 😊 నేను Mania Mobiles‌కు సంబంధించిన మొబైల్ మోడళ్లు, ధరలు, కలర్లు, స్టోరేజ్, స్టాక్, EMI, ఎక్స్చేంజ్, కొనుగోలు వివరాల్లో మాత్రమే సహాయం చేయగలను."
     if language == "roman_telugu":
-        return "Sorry 😊 Mania Mobiles mobile prices, stock, features, EMI, exchange mariyu purchase details lo help chestha. Mee question ni konchem detail ga cheppandi."
-    return "Sorry 😊 I can help with Mania Mobiles prices, stock, features, EMI, exchange, and purchase details. Please tell me a little more about your question."
+        return "Sorry 😊 Nenu Mania Mobiles ki sambandhinchina mobile models, prices, colors, storage, stock, EMI, exchange mariyu purchase details lo maatrame help cheyyagalanu."
+    return "Sorry 😊 I can only help with Mania Mobiles mobile models, prices, colors, storage, stock, EMI, exchange, and purchase details."
 
 
 def _process_message_serialized(customer_id: str, message: str) -> dict:
@@ -4167,7 +4238,7 @@ def _process_message_serialized(customer_id: str, message: str) -> dict:
     elif is_greeting:
         language = _resolve_response_language(message, session)
         next_missing_field = next(
-            (field for field in FIELD_ORDER if not _field_is_complete(field, session.get("customer", {}))),
+            (field for field in FIELD_ORDER if not _field_is_complete(field, session.get("customer", {}), session)),
             None,
         )
         if previous_history_len > 0 and next_missing_field:
@@ -4183,15 +4254,15 @@ def _process_message_serialized(customer_id: str, message: str) -> dict:
             )
         elif language == "telugu":
             greeting_reply = (
-                "నమస్కారం! Mania Mobiles‌కు స్వాగతం 😊 మీ ఫోన్ కొనుగోలుకు సంబంధించిన సందేహాల్లో సహాయం చేస్తాను. మీరు చూస్తున్న బ్రాండ్/మోడల్ పేరు చెప్పండి. ఉదాహరణకు iPhone 16."
+                "హాయ్! Mania Mobiles కి స్వాగతం 😊 మొబైల్ మోడళ్లు, ధరలు, కలర్లు, స్టోరేజ్ ఆప్షన్లలో సహాయం చేస్తాను. మీకు ఏ మొబైల్ గురించి తెలుసుకోవాలి? ఏ బ్రాండ్/మోడల్ అయినా చెప్పండి."
                 if previous_history_len == 0
-                else "హాయ్ 😊 మీ ఫోన్ కొనుగోలుకు సంబంధించిన సందేహాల్లో సహాయం చేస్తాను. మీరు చూస్తున్న బ్రాండ్/మోడల్ పేరు చెప్పండి. ఉదాహరణకు iPhone 16."
+                else "హాయ్ 😊 Mania Mobiles మొబైల్ వివరాల్లో సహాయం చేస్తాను. మీరు చూస్తున్న బ్రాండ్/మోడల్ పేరు చెప్పండి."
             )
         else:
             greeting_reply = (
-                "Hi! Mania Mobiles ki welcome 😊 Mee phone purchase ki sambandhinchina questions lo help chestha. Ye brand/model chusthunnaru? Example: iPhone 16."
+                "Hi! Mania Mobiles ki welcome 😊 Mobile models, prices, colors, storage options lo help chestha. Meeku ye mobile gurinchi telusukovali? Ye brand/model aina cheppandi."
                 if previous_history_len == 0
-                else "Hi 😊 Mee phone purchase ki sambandhinchina questions lo help chestha. Ye brand/model chusthunnaru? Example: iPhone 16."
+                else "Hi 😊 Mania Mobiles mobile details lo help chestha. Ye brand/model chusthunnaru?"
             )
 
         result = {
