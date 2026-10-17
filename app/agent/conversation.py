@@ -799,15 +799,16 @@ def _catalog_options_only_message(model: str, language: str, storage: str = "", 
     if telugu:
         title = f"{model} కోసం కాటలాగ్‌లో కనిపించిన వేరియంట్లు:"
         note = "గమనిక: ఇవి కాటలాగ్ వివరాలు మాత్రమే; తాజా ధర, స్టాక్‌ను స్టోర్‌తో నిర్ధారించాలి."
-        ask = "మీకు ఏ స్టోరేజ్ కావాలి? కలర్ చెబితే దానికి సరిపోయే లింక్ చూపిస్తాను; కలర్ తప్పనిసరి కాదు."
+        ask = "మీకు ఏ స్టోరేజ్ కావాలి? ఏ కలర్ కావాలి?" if not storage else ""
     else:
         title = f"{model} ki catalog lo kanipinchina variants:"
         note = "Note: ivi catalog details matrame; latest price/stock store tho confirm cheyyali."
-        ask = "Ye storage kavali? Color chepthe matching link chupistha; color optional."
+        ask = "Ye storage kavali? Ye color kavali?" if not storage else ""
     # Never dump all product URLs into a variants message. One link maximum.
     if storage and selected_link:
         lines.append(f"Product link: {selected_link}")
-    return title + "\n" + "\n".join(lines) + "\n\n" + note + "\n\n" + ask
+    suffix = ("\n\n" + ask) if ask else ""
+    return title + "\n" + "\n".join(lines) + "\n\n" + note + suffix
 
 
 def _get_product_message(
@@ -2442,6 +2443,13 @@ def _parse_explicit_budget_amount(message: str, asked_field: str = ""):
         r"\b(?:budget|rs\.?|rupees?|inr|under|below|around|approx(?:imately)?|lakh|lakhs|lac|lacs|lakh[s]?|thousand|koti|naa budget|na budget|lopu|varaku)\b",
         text,
     )) or " rs " in f" {text} "
+    # Also recognize shorthand money amounts embedded after variant details,
+    # e.g. "128GB, 53k" or "black 128 53k". Storage values themselves do not
+    # match this pattern because they are followed by GB/TB, not a money unit.
+    shorthand_amount = bool(re.search(
+        r"(?<![\w])\d+(?:\.\d+)?\s*(?:k|lakh|lakhs|lac|lacs)\b",
+        text,
+    ))
     # A customer may send multiple details together: "black color, 128, 53000".
     # In a live product conversation, a standalone realistic 4-8 digit amount
     # alongside a variant/color is an explicit budget signal even without the
@@ -2451,7 +2459,7 @@ def _parse_explicit_budget_amount(message: str, asked_field: str = ""):
         text,
     ))
     large_numeric_amount = bool(re.search(r"(?<![\w])\d{4,8}(?![\w])", text))
-    budget_context = explicit_budget_words or (
+    budget_context = explicit_budget_words or shorthand_amount or (
         variant_context and large_numeric_amount
     )
     bare_amount = asked_field == "budget" and bool(re.match(r"^\s*[\d,]+(?:\.\d+)?\s*(?:k|l|lac|lacs|lakh|lakhs)?(?:\s|$)", text))
@@ -2755,7 +2763,7 @@ def _process_message_impl(
         extracted["budget"] = parsed_budget
         extracted["budget_amount"] = parsed_budget
     explicit_budget_context = bool(re.search(
-        r"(?:₹|\brs\.?\b|\brupees?\b|\bbudget\b|\bunder\b|\bbelow\b|\baround\b|\bapprox(?:imately)?\b|\blopu\b|\bvaraku\b|\bnaa budget\b|\bna budget\b|\blakh(?:s)?\b|\blac(?:s)?\b|\bthousand\b)",
+        r"(?:₹|\brs\.?\b|\brupees?\b|\bbudget\b|\bunder\b|\bbelow\b|\baround\b|\bapprox(?:imately)?\b|\blopu\b|\bvaraku\b|\bnaa budget\b|\bna budget\b|\blakh(?:s)?\b|\blac(?:s)?\b|\bthousand\b|(?<![\w])\d+(?:\.\d+)?\s*(?:k|lakh|lakhs|lac|lacs)\b)",
         message_lower,
     )) or bool(
         re.search(r"\b(?:black|white|blue|pink|green|teal|ultramarine|yellow|purple|natural|titanium|silver|gold|midnight|starlight|graphite|desert|sierra|red|color|colour|gb|tb|storage)\b", message_lower)
@@ -3043,8 +3051,23 @@ def _process_message_impl(
     variant_is_complete = bool(current_product and current_storage)
     variants_for_storage = _catalog_products_for_model(current_product, storage=current_storage) if current_product and current_storage else []
     colors_for_storage = {_catalog_color(item) for item in variants_for_storage if _catalog_color(item)}
-    color_resolved = bool(current_color) or len(colors_for_storage) <= 1
-    if _is_specific_model_name(current_product) and (product_named_now or variant_supplied_now or session.get("catalog_variant_unresolved")):
+    # Color is optional. Once storage is known, do not keep the customer stuck
+    # asking for a color; present the matching storage options and at most one link.
+    color_resolved = bool(current_color) or bool(current_storage) or len(colors_for_storage) <= 1
+    # A model-only message is a discovery turn, not permission to dump the
+    # catalog. Ask for storage, optional color, and budget first. Do not return
+    # product names/prices/URLs until the customer has supplied preferences.
+    model_only_needs_preferences = bool(
+        _is_specific_model_name(current_product)
+        and product_named_now
+        and not current_storage
+        and not current_color
+    )
+    if model_only_needs_preferences:
+        product_message = ""
+        session["catalog_product"] = None
+        session["catalog_message_sent"] = False
+    if _is_specific_model_name(current_product) and (product_named_now or variant_supplied_now or session.get("catalog_variant_unresolved")) and not model_only_needs_preferences:
         if variant_is_complete and color_resolved:
             # A direct product URL is returned only for a unique exact model,
             # storage, and color match. Never substitute a nearby variant.
@@ -3054,6 +3077,15 @@ def _process_message_impl(
             if len(exact_matches) == 1:
                 product_message = _get_product_message(variant_key, variant_key, active_language)
                 session["catalog_product"] = variant_key if product_message else None
+                session.pop("catalog_variant_unresolved", None)
+            elif len(exact_matches) > 1 and current_storage and not current_color:
+                # Storage is known and color is optional: show only options for
+                # that storage, with one link maximum, and continue qualification
+                # without asking for color again.
+                product_message = _catalog_options_only_message(
+                    current_product, active_language, storage=current_storage
+                )
+                session["catalog_product"] = None
                 session.pop("catalog_variant_unresolved", None)
             elif len(exact_matches) > 1:
                 product_message = _catalog_options_only_message(
@@ -3174,7 +3206,19 @@ def _process_message_impl(
 
             )
 
-        if product_message and next_field == "budget" and _is_specific_model_name(current_product):
+        if model_only_needs_preferences:
+            # Ask once for storage, mention color is optional, and collect the
+            # budget in the same turn. No catalog product list or URL here.
+            if active_language == "telugu":
+                preference_question = "మీకు ఏ స్టోరేజ్ వేరియంట్ కావాలి (128GB/256GB వంటివి)? ఏ కలర్ కావాలి?"
+                if not customer.get("budget"):
+                    preference_question += " మీ బడ్జెట్ ఎంత అనుకుంటున్నారు?"
+            else:
+                preference_question = "Ye storage variant kavali (128GB/256GB lantivi)? Ye color kavali?"
+                if not customer.get("budget"):
+                    preference_question += " Mee budget entha anukuntunnaru?"
+            message_parts.append(preference_question)
+        elif product_message and next_field == "budget" and _is_specific_model_name(current_product):
             if session.get("catalog_variant_unresolved"):
                 if active_language == "telugu":
                     combined_question = "పైన ఉన్న కాటలాగ్ ఆప్షన్లలో సరిపోయే వేరియంట్‌ను ఎంచుకోండి. మీ బడ్జెట్ ఎంత అనుకుంటున్నారు?"
