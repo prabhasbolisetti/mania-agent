@@ -2,6 +2,8 @@ import json
 import os
 import re
 import time
+import threading
+from collections import Counter
 from typing import Any, Optional
 
 import requests
@@ -26,6 +28,79 @@ MODEL_NAME = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
 _MODEL_FAILURE_WARNED = False
 _MODEL_RETRY_AFTER = 0.0
 
+# Process-local LLM usage counters. Render logs are the durable audit trail;
+# these counters reset whenever this worker restarts.
+_LLM_USAGE_LOCK = threading.Lock()
+_LLM_USAGE = {
+    "total_requests": 0,
+    "successful_requests": 0,
+    "failed_requests": 0,
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "by_provider": Counter(),
+    "by_model": Counter(),
+}
+_LLM_CALL_SEQUENCE = 0
+
+
+def get_llm_usage_stats() -> dict:
+    """Return a thread-safe snapshot of this worker's LLM request counters."""
+    with _LLM_USAGE_LOCK:
+        return {
+            "total_requests": _LLM_USAGE["total_requests"],
+            "successful_requests": _LLM_USAGE["successful_requests"],
+            "failed_requests": _LLM_USAGE["failed_requests"],
+            "input_tokens": _LLM_USAGE["input_tokens"],
+            "output_tokens": _LLM_USAGE["output_tokens"],
+            "by_provider": dict(_LLM_USAGE["by_provider"]),
+            "by_model": dict(_LLM_USAGE["by_model"]),
+        }
+
+
+def _llm_request_started(provider: str, model: str) -> tuple[str, float]:
+    """Count one actual outbound model request, including requests that fail."""
+    global _LLM_CALL_SEQUENCE
+    started = time.monotonic()
+    with _LLM_USAGE_LOCK:
+        _LLM_CALL_SEQUENCE += 1
+        call_id = f"llm-{_LLM_CALL_SEQUENCE}"
+        _LLM_USAGE["total_requests"] += 1
+        _LLM_USAGE["by_provider"][provider] += 1
+        _LLM_USAGE["by_model"][model] += 1
+        total = _LLM_USAGE["total_requests"]
+    print(
+        f"LLM_USAGE event=request_started call_id={call_id} "
+        f"provider={provider} model={model} worker_total={total}"
+    )
+    return call_id, started
+
+
+def _llm_request_finished(
+    call_id: str,
+    provider: str,
+    model: str,
+    started: float,
+    *,
+    success: bool,
+    input_tokens: Optional[int] = None,
+    output_tokens: Optional[int] = None,
+) -> None:
+    """Record request outcome and token counts when the provider returns them."""
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    with _LLM_USAGE_LOCK:
+        key = "successful_requests" if success else "failed_requests"
+        _LLM_USAGE[key] += 1
+        if input_tokens is not None:
+            _LLM_USAGE["input_tokens"] += max(0, int(input_tokens))
+        if output_tokens is not None:
+            _LLM_USAGE["output_tokens"] += max(0, int(output_tokens))
+    print(
+        f"LLM_USAGE event=request_finished call_id={call_id} "
+        f"provider={provider} model={model} "
+        f"status={'success' if success else 'failed'} duration_ms={elapsed_ms} "
+        f"input_tokens={input_tokens if input_tokens is not None else 'unknown'} "
+        f"output_tokens={output_tokens if output_tokens is not None else 'unknown'}"
+    )
 
 
 def _llm_provider() -> str:
@@ -85,6 +160,7 @@ def _call_text_model(
         return None
 
     timeout = float(os.getenv("LLM_TIMEOUT_SECONDS", "20"))
+    active_call = None
 
     try:
         if provider == "gemini":
@@ -113,6 +189,8 @@ def _call_text_model(
             if json_mode:
                 payload["generationConfig"]["responseMimeType"] = "application/json"
 
+            call_id, call_started = _llm_request_started(provider, model)
+            active_call = (call_id, provider, model, call_started)
             response = requests.post(
                 f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
                 headers={
@@ -124,6 +202,13 @@ def _call_text_model(
             )
             response.raise_for_status()
             data = response.json()
+            usage = data.get("usageMetadata") or {}
+            _llm_request_finished(
+                call_id, provider, model, call_started, success=True,
+                input_tokens=usage.get("promptTokenCount"),
+                output_tokens=usage.get("candidatesTokenCount"),
+            )
+            active_call = None
 
             candidates = data.get("candidates") or []
             if not candidates:
@@ -159,6 +244,8 @@ def _call_text_model(
             if json_mode:
                 payload["response_format"] = {"type": "json_object"}
 
+            call_id, call_started = _llm_request_started(provider, model)
+            active_call = (call_id, provider, model, call_started)
             response = requests.post(
                 f"{base_url}/chat/completions",
                 headers={"Authorization": f"Bearer {api_key}"},
@@ -167,6 +254,13 @@ def _call_text_model(
             )
             response.raise_for_status()
             data = response.json()
+            usage = data.get("usage") or {}
+            _llm_request_finished(
+                call_id, provider, model, call_started, success=True,
+                input_tokens=usage.get("prompt_tokens"),
+                output_tokens=usage.get("completion_tokens"),
+            )
+            active_call = None
             text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
             return str(text).strip() or None
 
@@ -182,10 +276,22 @@ def _call_text_model(
             if json_mode:
                 kwargs["format"] = "json"
 
+            call_id, call_started = _llm_request_started(provider, MODEL_NAME)
+            active_call = (call_id, provider, MODEL_NAME, call_started)
             result = ollama_chat(**kwargs)
+            input_tokens = getattr(result, "prompt_eval_count", None)
+            output_tokens = getattr(result, "eval_count", None)
+            _llm_request_finished(
+                call_id, provider, MODEL_NAME, call_started, success=True,
+                input_tokens=input_tokens, output_tokens=output_tokens,
+            )
+            active_call = None
             return str(result.message.content or "").strip() or None
 
     except requests.HTTPError as exc:
+        if active_call is not None:
+            _llm_request_finished(*active_call[:3], active_call[3], success=False)
+            active_call = None
         _MODEL_RETRY_AFTER = time.monotonic() + 30
         status_code = exc.response.status_code if exc.response is not None else "unknown"
         # Do not log request headers or API keys. The response body is intentionally
@@ -194,6 +300,9 @@ def _call_text_model(
         if not _MODEL_FAILURE_WARNED:
             _MODEL_FAILURE_WARNED = True
     except Exception as exc:
+        if active_call is not None:
+            _llm_request_finished(*active_call[:3], active_call[3], success=False)
+            active_call = None
         _MODEL_RETRY_AFTER = time.monotonic() + 30
         if not _MODEL_FAILURE_WARNED:
             print("Language model unavailable; using safe fallback:", type(exc).__name__)
