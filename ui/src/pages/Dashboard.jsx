@@ -1004,6 +1004,16 @@ function Dashboard() {
             <div className="dashboard-header-actions">
               <button
                 type="button"
+                className="refresh-button"
+                onClick={() => navigate("/products-campaigns")}
+                aria-label="Open products and campaigns"
+                title="Manage products and campaign previews"
+              >
+                <span aria-hidden="true">▣</span>
+                <span>Products &amp; Campaigns</span>
+              </button>
+              <button
+                type="button"
                 className="today-button"
                 onClick={() =>
                   setTodayOpen(

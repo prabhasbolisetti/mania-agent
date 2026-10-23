@@ -1,541 +1,787 @@
+
+"""Authenticated product management and product-specific WhatsApp campaigns.
+
+Campaign sends are explicit admin actions, require verified catalog pricing and
+explicit marketing consent, and never enter the normal AI conversation flow.
+"""
+
+from __future__ import annotations
+
+import logging
 import os
-import json
-import hmac
-import hashlib
-import traceback
-from threading import Lock
-from collections import deque
-from fastapi import APIRouter, HTTPException, Request, Depends, Response
-from pydantic import BaseModel
-from starlette.concurrency import run_in_threadpool
-from app.api.auth import (
-    authenticate_admin,
-    create_session,
-    delete_session,
-    get_current_admin,
-    get_optional_current_admin,
-    SESSION_COOKIE_NAME,
-    SESSION_MAX_AGE_SECONDS,
-)
-from app.database.storage import get_all_leads, has_processed_whatsapp_message
-from app.database.supabase_client import supabase
+import uuid
+import re
 from datetime import datetime, timezone
-from app.agent.conversation import process_message, attach_whatsapp_message_id
-from app.whatsapp.service import send_whatsapp_message
-from app.config import env_bool
-router = APIRouter()
-WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "")
-WHATSAPP_APP_SECRET = os.getenv("WHATSAPP_APP_SECRET", "")
+from typing import Any, Optional
 
-# Meta may retry while the first webhook is still processing. The database
-# check handles persisted IDs; this in-process guard prevents concurrent
-# requests in the same Render worker from sending the same reply twice.
-_WEBHOOK_ID_LOCK = Lock()
-_WEBHOOK_INFLIGHT_IDS = set()
-_WEBHOOK_COMPLETED_IDS = set()
-_WEBHOOK_COMPLETED_ORDER = deque()
-_WEBHOOK_COMPLETED_LIMIT = 5000
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from app.api.auth import get_current_admin
+from app.database.supabase_client import supabase
+from app.whatsapp.service import (
+    send_whatsapp_campaign_template,
+    send_whatsapp_interactive_buttons,
+)
 
-def _claim_whatsapp_message_id(message_id: str) -> bool:
-    message_id = str(message_id or "").strip()
-    if not message_id:
-        return True
-    with _WEBHOOK_ID_LOCK:
-        if message_id in _WEBHOOK_INFLIGHT_IDS or message_id in _WEBHOOK_COMPLETED_IDS:
-            return False
-        _WEBHOOK_INFLIGHT_IDS.add(message_id)
-        return True
+logger = logging.getLogger(__name__)
+
+router = APIRouter(
+    prefix="/products-campaigns",
+    tags=["Products & Campaigns"],
+)
+
+PAGE_SIZE = 500
+MAX_PRODUCT_ID = 2_147_483_647
 
 
-def _finish_whatsapp_message_id(message_id: str, completed: bool = False) -> None:
-    message_id = str(message_id or "").strip()
-    if not message_id:
-        return
-    with _WEBHOOK_ID_LOCK:
-        _WEBHOOK_INFLIGHT_IDS.discard(message_id)
-        if not completed or message_id in _WEBHOOK_COMPLETED_IDS:
-            return
-        if len(_WEBHOOK_COMPLETED_ORDER) >= _WEBHOOK_COMPLETED_LIMIT:
-            expired = _WEBHOOK_COMPLETED_ORDER.popleft()
-            _WEBHOOK_COMPLETED_IDS.discard(expired)
-        _WEBHOOK_COMPLETED_ORDER.append(message_id)
-        _WEBHOOK_COMPLETED_IDS.add(message_id)
+class ProductUpdate(BaseModel):
+    """Fields that the owner can edit from the product dashboard."""
 
-# =========================================================
-# ADMIN AUTHENTICATION
+    model_config = ConfigDict(extra="forbid")
 
-# =========================================================
-
-class LoginRequest(BaseModel):
-    username: str
-    password: str
-
-@router.post("/auth/login")
-
-def admin_login(request: LoginRequest, response: Response):
-    username = request.username.strip()
-    password = request.password
-    if not username or not password:
-        raise HTTPException(
-            status_code=400,
-            detail="Username and password are required.",
-        )
-    try:
-        authenticated = authenticate_admin(
-            username,
-            password,
-        )
-    except RuntimeError as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=str(exc),
-        )
-    if not authenticated:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid username or password.",
-        )
-    session_id = create_session(username)
-    response.set_cookie(
-        key=SESSION_COOKIE_NAME,
-        value=session_id,
-        httponly=True,
-        secure=env_bool("COOKIE_SECURE", default=bool(os.getenv("RENDER")),),
-        samesite="lax",
-        max_age=SESSION_MAX_AGE_SECONDS,
+    price: Optional[float] = Field(
+        default=None,
+        ge=0,
+        le=100_000_000,
+        allow_inf_nan=False,
     )
-    return {
-        "authenticated": True,
-        "username": username,
-    }
+    battery_health: Optional[str] = Field(
+        default=None,
+        max_length=40,
+    )
+    campaign_enabled: Optional[bool] = None
+    stock_status: Optional[str] = Field(
+        default=None,
+        max_length=40,
+    )
 
-@router.get("/auth/me")
+    @model_validator(mode="after")
+    def must_include_a_change(self):
+        if not self.model_fields_set:
+            raise ValueError("Provide at least one field to update.")
 
-def current_admin(request: Request):
-    """Return session state without treating a normal logged-out check as an error."""
-    admin = get_optional_current_admin(request)
-    if not admin:
-        return {"authenticated": False, "username": None}
-    return {
-        "authenticated": True,
-        "username": admin.get("username"),
-    }
+        return self
 
-# =========================================================
-# LEAD DASHBOARD API
 
-# =========================================================
+class CampaignPreviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
 
-@router.get("/leads")
+    product_id: int = Field(gt=0, le=MAX_PRODUCT_ID)
+    audience_scope: str = Field(
+        default="brand",
+        pattern="^(brand|product)$",
+    )
 
-def get_leads(
-    admin: dict = Depends(get_current_admin),
-):
-    """
-    Return all saved leads.
-    Authentication required.
-    """
-    leads = get_all_leads()
-    return {
-        "count": len(leads),
-        "leads": leads,
-    }
 
-class CallStatusUpdate(BaseModel):
-    call_completed: bool
+def _paged_select(table: str, columns: str) -> list[dict]:
+    """Read a table in pages to avoid silently relying on the default row cap."""
+    rows: list[dict] = []
+    offset = 0
 
-@router.patch("/leads/{lead_id}/call-status")
-
-def update_lead_call_status(
-    lead_id: str,
-    payload: CallStatusUpdate,
-    admin: dict = Depends(get_current_admin),
-):
-    """Persist call completion status for an authenticated admin."""
-    completed_at = datetime.now(timezone.utc).isoformat() if payload.call_completed else None
-    try:
+    while True:
         result = (
-            supabase.table("leads")
-            .update({
-                "call_completed": payload.call_completed,
-                "call_completed_at": completed_at,
-            })
-            .eq("id", lead_id)
+            supabase.table(table)
+            .select(columns)
+            .order("id")
+            .range(offset, offset + PAGE_SIZE - 1)
             .execute()
         )
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail="Unable to save call status.") from exc
-    if not result.data:
-        raise HTTPException(status_code=404, detail="Lead not found.")
-    return result.data[0]
 
-@router.get("/leads/{lead_id}")
+        batch = result.data or []
+        rows.extend(
+            row for row in batch if isinstance(row, dict)
+        )
 
-def get_lead(
-    lead_id: str,
-    admin: dict = Depends(get_current_admin),
-):
-    """
-    Return one lead by lead_id.
-    Authentication required.
-    """
-    leads = get_all_leads()
-    for lead in leads:
-        if lead.get("lead_id") == lead_id:
-            return lead
-    raise HTTPException(
-        status_code=404,
-        detail="Lead not found.",
+        if len(batch) < PAGE_SIZE:
+            return rows
+
+        offset += PAGE_SIZE
+
+
+def _database_error(message: str, exc: Exception) -> HTTPException:
+    """Log database details privately and return a safe API error."""
+    logger.exception("%s", message, exc_info=exc)
+
+    return HTTPException(
+        status_code=500,
+        detail=message,
     )
 
-# =========================================================
-# CHAT API
 
-# =========================================================
+def _norm(value: Any) -> str:
+    """Normalize text for case-insensitive matching."""
+    return re.sub(
+        r"[^a-z0-9]+",
+        " ",
+        str(value or "").lower(),
+    ).strip()
 
-class ChatRequest(BaseModel):
-    customer_id: str
-    message: str
 
-@router.post("/chat")
+def _lead_search_text(lead: dict) -> str:
+    """Build searchable text from the structured lead-interest fields."""
+    customer_data = lead.get("customer_data")
 
-def chat(request: ChatRequest):
-    customer_id = request.customer_id.strip()
-    message = request.message.strip()
-    if not customer_id:
-        raise HTTPException(
-            status_code=400,
-            detail="customer_id cannot be empty",
-        )
-    if not message:
-        raise HTTPException(
-            status_code=400,
-            detail="message cannot be empty",
-        )
-    try:
-        return process_message(
-            customer_id,
-            message,
-        )
-    except Exception as exc:
-        print(
-            f"Chat processing error: {exc}"
-        )
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "Failed to process the message. "
-                "Check the server terminal."
-            ),
-        )
+    if isinstance(customer_data, str):
+        # Some older records may contain JSON serialized as text.
+        # Avoid guessing its structure if it cannot be parsed.
+        import json
 
-# =========================================================
-# WHATSAPP WEBHOOK VERIFICATION
+        try:
+            customer_data = json.loads(customer_data)
+        except (ValueError, TypeError):
+            customer_data = {}
 
-# =========================================================
+    if not isinstance(customer_data, dict):
+        customer_data = {}
 
-@router.get("/webhook")
+    fields = [
+        lead.get("product_interest"),
+        lead.get("product_url"),
+        customer_data.get("product_interest"),
+        customer_data.get("product"),
+        customer_data.get("model"),
+        customer_data.get("brand"),
+        customer_data.get("product_url"),
+    ]
 
-def verify_webhook(request: Request):
-    """
-    Meta webhook verification endpoint.
-    Meta sends:
-        hub.mode
-        hub.verify_token
-        hub.challenge
-    We return hub.challenge when our verification
-    token matches.
-    """
-    params = request.query_params
-    mode = params.get("hub.mode")
-    token = params.get("hub.verify_token")
-    challenge = params.get("hub.challenge")
-    print("\n========== WEBHOOK VERIFICATION ==========")
-    print("Mode:", mode)
-    print("Verify token configured:", bool(WHATSAPP_VERIFY_TOKEN))
-    print("Challenge present:", bool(challenge))
-    print("==========================================\n")
-    if (
-        mode == "subscribe"
-        and token == WHATSAPP_VERIFY_TOKEN
-    ):
-        return int(challenge)
-    raise HTTPException(
-        status_code=403,
-        detail="Webhook verification failed",
-    )
+    return _norm(" ".join(str(value) for value in fields if value))
 
-# =========================================================
-# META SIGNATURE VERIFICATION
 
-# =========================================================
-
-def verify_meta_signature(
-    raw_body: bytes,
-    signature: str,
+def _product_matches_lead(
+    product: dict,
+    lead: dict,
+    scope: str,
 ) -> bool:
+    """Match stored lead-interest fields against a product.
+
+    This intentionally uses structured lead data, not raw conversation
+    messages. Counts therefore reflect stored interest fields, not every
+    mention in conversation history.
     """
-    Verify Meta's X-Hub-Signature-256 header.
-    This protects the webhook from arbitrary requests.
-    """
-    if not WHATSAPP_APP_SECRET:
-        # Local development can opt out, but deployed services should verify
-        # Meta signatures by default.
-        require_signature = env_bool(
-            "WHATSAPP_REQUIRE_SIGNATURE",
-            default=bool(os.getenv("RENDER")),
-        )
-        if require_signature:
-            print("ERROR: WHATSAPP_APP_SECRET is required for webhook verification.")
+    text = _lead_search_text(lead)
+
+    if not text:
+        return False
+
+    brand = _norm(product.get("brand"))
+    title = _norm(product.get("title") or product.get("model"))
+    model = _norm(product.get("model"))
+
+    if scope == "brand":
+        if not brand:
             return False
-        print("WARNING: Meta signature verification is disabled for this environment.")
-        return True
-    if not signature:
-        print(
-            "ERROR: Missing "
-            "X-Hub-Signature-256 header."
+
+        return bool(
+            re.search(
+                rf"\b{re.escape(brand)}\b",
+                text,
+            )
         )
-        return False
-    if not signature.startswith("sha256="):
-        print(
-            "ERROR: Invalid "
-            "X-Hub-Signature-256 format."
+
+    candidates = [
+        candidate
+        for candidate in (title, model)
+        if candidate and len(candidate) >= 4
+    ]
+
+    return any(
+        re.search(
+            rf"\b{re.escape(candidate)}\b",
+            text,
         )
-        return False
-    received_signature = signature.split(
-        "=",
-        1,
-    )[1]
-    expected_signature = hmac.new(
-        WHATSAPP_APP_SECRET.encode("utf-8"),
-        raw_body,
-        hashlib.sha256,
-    ).hexdigest()
-    is_valid = hmac.compare_digest(
-        received_signature,
-        expected_signature,
+        for candidate in candidates
     )
-    if not is_valid:
-        print(
-            "ERROR: Invalid Meta webhook signature."
-        )
-    else:
-        print(
-            "Meta webhook signature "
-            "verified successfully."
-        )
-    return is_valid
 
-# =========================================================
-# WHATSAPP WEBHOOK
 
-# =========================================================
+def _customer_key(lead: dict) -> str:
+    """Deduplicate records for the same known phone number."""
+    phone = str(lead.get("phone_number") or "").strip()
 
-@router.post("/webhook")
+    if phone and phone.lower() != "unknown":
+        # Normalize common formatting differences.
+        digits = re.sub(r"\D", "", phone)
 
-async def whatsapp_webhook(request: Request):
-    """
-    Receive incoming WhatsApp messages from Meta.
-    Individual message failures are logged with a full traceback so the
-    actual failing component is visible in the terminal. One bad message
-    will not crash the entire webhook request.
-    """
-    raw_body = await request.body()
-    # Do not log full headers or webhook bodies: they contain customer
-    # phone numbers, message contents, and signature metadata.
-    print("\n========== WHATSAPP WEBHOOK RECEIVED ==========")
-    print("Content length:", len(raw_body))
-    print("Signature header present:", bool(request.headers.get("X-Hub-Signature-256")))
-    print("===============================================\n")
-    # -----------------------------------------------------
-    # 1. Verify Meta signature
-    # -----------------------------------------------------
-    signature = request.headers.get("X-Hub-Signature-256")
-    if not verify_meta_signature(raw_body, signature):
-        raise HTTPException(
-            status_code=403,
-            detail="Invalid webhook signature",
-        )
-    # -----------------------------------------------------
-    # 2. Parse JSON
-    # -----------------------------------------------------
+        if digits:
+            return f"phone:{digits}"
+
+    # Leads without a usable number must not be counted as one shared customer.
+    return f"lead:{lead.get('id')}"
+
+
+def _unique_leads(leads: list[dict]) -> list[dict]:
+    """Keep one record per customer, preferring the first matching record."""
+    unique: dict[str, dict] = {}
+
+    for lead in leads:
+        key = _customer_key(lead)
+
+        if key not in unique:
+            unique[key] = lead
+
+    return list(unique.values())
+
+
+def _product_interest_counts(
+    products: list[dict],
+    leads: list[dict],
+) -> dict[int, dict]:
+    """Calculate unique-customer brand and product interest counts."""
+    counts: dict[int, dict] = {}
+
+    for product in products:
+        product_id = int(product["id"])
+        brand_customers: set[str] = set()
+        product_customers: set[str] = set()
+
+        for lead in leads:
+            key = _customer_key(lead)
+
+            if _product_matches_lead(product, lead, "brand"):
+                brand_customers.add(key)
+
+            if _product_matches_lead(product, lead, "product"):
+                product_customers.add(key)
+
+        counts[product_id] = {
+            "brand_interest_count": len(brand_customers),
+            "product_interest_count": len(product_customers),
+        }
+
+    return counts
+
+
+def _parse_datetime(value: Any) -> Optional[datetime]:
+    """Parse a timestamp as UTC-aware datetime; return None if invalid."""
+    if not value:
+        return None
+
     try:
-        payload = json.loads(raw_body)
-    except json.JSONDecodeError:
-        print("ERROR: Invalid JSON received from webhook.")
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid JSON payload",
+        parsed = datetime.fromisoformat(
+            str(value).replace("Z", "+00:00")
         )
-    processed_messages = 0
-    failed_messages = 0
-    # -----------------------------------------------------
-    # 3. Process WhatsApp event
-    # -----------------------------------------------------
+
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+
+        return parsed.astimezone(timezone.utc)
+
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
+def _has_valid_phone(lead: dict) -> bool:
+    phone = str(lead.get("phone_number") or "").strip()
+
+    return bool(
+        phone
+        and phone.lower() != "unknown"
+        and re.search(r"\d", phone)
+    )
+
+
+def _is_explicitly_opted_in(lead: dict) -> bool:
+    """Require explicit consent and exclude anyone who has opted out."""
+    return (
+        lead.get("marketing_opt_in") is True
+        and lead.get("marketing_opt_out") is not True
+    )
+
+
+def _is_opted_in_at_valid_time(lead: dict) -> bool:
+    """Check that an opt-in timestamp exists for opted-in records."""
+    if not _is_explicitly_opted_in(lead):
+        return False
+
+    opted_in_at = _parse_datetime(lead.get("marketing_opt_in_at"))
+
+    if opted_in_at is None:
+        return False
+
+    return opted_in_at <= datetime.now(timezone.utc)
+
+
+def _has_open_customer_service_window(lead: dict) -> bool:
+    expiry = _parse_datetime(
+        lead.get("whatsapp_window_expires_at")
+    )
+
+    return bool(
+        expiry
+        and expiry > datetime.now(timezone.utc)
+    )
+
+
+@router.get("/products")
+def list_products(admin: dict = Depends(get_current_admin)):
+    """Return product rows and interest counts without returning lead PII."""
     try:
-        entries = payload.get("entry", [])
-        print(f"Entries received: {len(entries)}")
-        for entry in entries:
-            changes = entry.get("changes", [])
-            print(f"Changes received: {len(changes)}")
-            for change in changes:
-                value = change.get("value", {})
-                field = change.get("field", "unknown")
-                messages = value.get("messages") or []
-                statuses = value.get("statuses") or []
-                print("Webhook field:", field)
-                print("Incoming messages:", len(messages))
-                print("Status updates:", len(statuses))
-                for message in messages:
-                    message_type = message.get("type")
-                    print(
-                        "Incoming WhatsApp message type:",
-                        message_type,
-                    )
-                    # Only process text messages.
-                    if message_type != "text":
-                        print(
-                            "Ignoring unsupported message type:",
-                            message_type,
-                        )
-                        continue
-                    sender = message.get("from")
-                    message_text = (
-                        message.get("text", {}).get("body", "")
-                    )
-                    if not sender:
-                        print("Ignoring message: sender missing.")
-                        continue
-                    if not message_text:
-                        print("Ignoring message: text missing.")
-                        continue
-                    message_text = message_text.strip()
-                    masked_sender = ("*" * max(0, len(sender) - 4)) + sender[-4:]
-                    print("\n========== CUSTOMER MESSAGE ==========")
-                    print("Sender (masked):", masked_sender)
-                    print("Message characters:", len(message_text))
-                    print("======================================\n")
-                    whatsapp_message_id = message.get("id")
-                    if whatsapp_message_id:
-                        if not _claim_whatsapp_message_id(whatsapp_message_id):
-                            print("Ignoring duplicate/in-flight WhatsApp message ID.")
-                            continue
-                        try:
-                            if await run_in_threadpool(has_processed_whatsapp_message, whatsapp_message_id):
-                                print("Ignoring previously processed WhatsApp message ID.")
-                                _finish_whatsapp_message_id(whatsapp_message_id, completed=True)
-                                continue
-                        except Exception as exc:
-                            # Continue service during a temporary lookup failure;
-                            # the in-process claim still prevents concurrent duplicates.
-                            print("Webhook deduplication lookup failed:", type(exc).__name__)
-                    customer_id = f"wa_{sender}"
-                    # -------------------------------------------------
-                    # 4. Run the existing agent
-                    # -------------------------------------------------
-                    try:
-                        result = await run_in_threadpool(
-                            process_message,
-                            customer_id,
-                            message_text,
-                        )
-                        print("\n========== AGENT RESULT ==========")
-                        print("Response prepared:", bool(result.get("message")))
-                        print("Lead record persisted:", bool(result.get("lead_id")))
-                        print("Qualification completed:", bool(result.get("lead_saved")))
-                        print("===================================\n")
-                    except Exception as exc:
-                        failed_messages += 1
-                        print(
-                            "\n========== AGENT PROCESSING ERROR =========="
-                        )
-                        print("Customer (masked):", masked_sender)
-                        print("Error type:", type(exc).__name__)
-                        print("Error:", str(exc))
-                        print("Full traceback:")
-                        traceback.print_exc()
-                        print("============================================\n")
-                        # Do not send a fake response. The traceback above
-                        # exposes the real failure so it can be fixed.
-                        _finish_whatsapp_message_id(whatsapp_message_id)
-                        continue
-                    # -------------------------------------------------
-                    # 5. Extract and send agent response
-                    # -------------------------------------------------
-                    reply = result.get(
-                        "message",
-                        "Sorry, I couldn't process that message.",
-                    )
-                    print("Reply prepared; character count:", len(reply))
-                    try:
-                        whatsapp_result = await run_in_threadpool(
-                            send_whatsapp_message,
-                            sender,
-                            reply,
-                        )
-                        if whatsapp_message_id:
-                            await run_in_threadpool(
-                                attach_whatsapp_message_id,
-                                customer_id,
-                                message_text,
-                                whatsapp_message_id,
-                            )
-                            _finish_whatsapp_message_id(whatsapp_message_id, completed=True)
-                        print("\n========== WHATSAPP SEND RESULT ==========")
-                        print("Meta accepted outbound message.")
-                        print("===========================================\n")
-                        processed_messages += 1
-                    except Exception as exc:
-                        failed_messages += 1
-                        print(
-                            "\n========== WHATSAPP SEND ERROR =========="
-                        )
-                        print("Customer (masked):", masked_sender)
-                        print("Error type:", type(exc).__name__)
-                        print("Error:", str(exc))
-                        print("Full traceback:")
-                        traceback.print_exc()
-                        print("==========================================\n")
-                        _finish_whatsapp_message_id(whatsapp_message_id)
-                        continue
+        products = _paged_select(
+            "products",
+            "id,title,model,brand,sku,price,original_price,battery_health,"
+            "stock_status,campaign_enabled,product_url,image_url,category,"
+            "storage,color,updated_at,price_verified,price_verified_at,"
+            "price_verified_by",
+        )
+
+        leads = (
+            _paged_select(
+                "leads",
+                "id,phone_number,product_interest,product_url,customer_data",
+            )
+            if products
+            else []
+        )
+
+        counts = _product_interest_counts(products, leads)
+
+        return {
+            "count": len(products),
+            "products": [
+                {
+                    **product,
+                    **counts.get(int(product["id"]), {}),
+                }
+                for product in products
+            ],
+            "interest_source": "stored lead product-interest fields",
+        }
+
+    except HTTPException:
+        raise
     except Exception as exc:
-        print(
-            "\n========== WHATSAPP WEBHOOK ERROR =========="
-        )
-        print("Error type:", type(exc).__name__)
-        print("Error:", str(exc))
-        print("Full traceback:")
-        traceback.print_exc()
-        print("============================================\n")
-        failed_messages += 1
-    # -----------------------------------------------------
-    # 6. Always acknowledge Meta
-    # -----------------------------------------------------
-    print("\n========== WEBHOOK SUMMARY ==========")
-    print("Processed messages:", processed_messages)
-    print("Failed messages:", failed_messages)
-    print("=====================================\n")
-    return {
-        "status": "ok",
-        "processed_messages": processed_messages,
-        "failed_messages": failed_messages,
-    }
+        raise _database_error(
+            "Could not load products and interest counts.",
+            exc,
+        ) from exc
 
-@router.post("/auth/logout")
 
-def admin_logout(
-    request: Request,
-    response: Response,
+@router.patch("/products/{product_id}")
+def update_product(
+    product_id: int,
+    payload: ProductUpdate,
     admin: dict = Depends(get_current_admin),
 ):
-    session_id = admin.get("session_id")
-    if session_id:
-        delete_session(session_id)
-    response.delete_cookie(
-        key=SESSION_COOKIE_NAME,
-    )
+    """Update product fields and invalidate verification if its price changes."""
+    changes = payload.model_dump(exclude_unset=True)
+
+    if not changes:
+        raise HTTPException(
+            status_code=400,
+            detail="No product fields supplied.",
+        )
+
+    try:
+        if "price" in changes:
+            # Read the current price before deciding whether verification
+            # must be invalidated. Verification metadata is never accepted
+            # from the client because ProductUpdate forbids extra fields.
+            current_result = (
+                supabase.table("products")
+                .select("id,price")
+                .eq("id", product_id)
+                .limit(1)
+                .execute()
+            )
+
+            current_rows = current_result.data or []
+
+            if not current_rows:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Product not found.",
+                )
+
+            current_price = current_rows[0].get("price")
+            new_price = changes["price"]
+
+            def normalized_price(value):
+                if value is None:
+                    return None
+                try:
+                    return round(float(value), 8)
+                except (TypeError, ValueError, OverflowError):
+                    return value
+
+            if normalized_price(current_price) != normalized_price(new_price):
+                changes.update({
+                    "price_verified": False,
+                    "price_verified_at": None,
+                    "price_verified_by": None,
+                })
+
+        result = (
+            supabase.table("products")
+            .update(changes)
+            .eq("id", product_id)
+            .select("*")
+            .execute()
+        )
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise _database_error(
+            "Could not update the product. Check the database schema and server logs.",
+            exc,
+        ) from exc
+
+    rows = result.data or []
+
+    if not rows:
+        raise HTTPException(
+            status_code=404,
+            detail="Product not found.",
+        )
+
     return {
-        "authenticated": False,
-        "message": "Logged out successfully.",
+        "updated": True,
+        "product": rows[0],
     }
+
+@router.post("/campaign-preview")
+def campaign_preview(
+    payload: CampaignPreviewRequest,
+    admin: dict = Depends(get_current_admin),
+):
+    """Preview matching leads and messaging eligibility without sending."""
+    try:
+        product_result = (
+            supabase.table("products")
+            .select(
+                "id,title,model,brand,price,battery_health,"
+                "product_url,campaign_enabled,stock_status,price_verified,"
+                "price_verified_at"
+            )
+            .eq("id", payload.product_id)
+            .limit(1)
+            .execute()
+        )
+
+        product_rows = product_result.data or []
+
+        if not product_rows:
+            raise HTTPException(
+                status_code=404,
+                detail="Product not found.",
+            )
+
+        product = product_rows[0]
+
+        leads = _paged_select(
+            "leads",
+            "id,phone_number,product_interest,product_url,customer_data,"
+            "marketing_opt_in,marketing_opt_in_at,marketing_opt_out,"
+            "whatsapp_window_expires_at",
+        )
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise _database_error(
+            "Could not prepare the campaign preview. Check the database schema and server logs.",
+            exc,
+        ) from exc
+
+    matched = _unique_leads(
+        [
+            lead
+            for lead in leads
+            if _product_matches_lead(
+                product,
+                lead,
+                payload.audience_scope,
+            )
+        ]
+    )
+
+    # A campaign must not be enabled merely because a preview can be created.
+    # Sending is disabled in this phase.
+    opted_in = [
+        lead
+        for lead in matched
+        if _has_valid_phone(lead)
+        and _is_opted_in_at_valid_time(lead)
+    ]
+
+    now = datetime.now(timezone.utc)
+
+    within_window = [
+        lead
+        for lead in opted_in
+        if (
+            _parse_datetime(lead.get("whatsapp_window_expires_at"))
+            or datetime.min.replace(tzinfo=timezone.utc)
+        ) > now
+    ]
+
+    template_required = [
+        lead
+        for lead in opted_in
+        if lead not in within_window
+    ]
+
+    return {
+        "product": {
+            "id": product["id"],
+            "title": product.get("title") or product.get("model"),
+            "brand": product.get("brand"),
+            "price": product.get("price"),
+            "battery_health": product.get("battery_health"),
+            "product_url": product.get("product_url"),
+            "campaign_enabled": product.get("campaign_enabled") is True,
+        },
+        "audience_scope": payload.audience_scope,
+        "matched_interest_count": len(matched),
+        "marketing_opted_in_count": len(opted_in),
+        "freeform_window_count": len(within_window),
+        "approved_template_required_count": len(template_required),
+        "price_verified": product.get("price_verified") is True,
+        "stock_status": product.get("stock_status"),
+        "send_enabled": (
+            product.get("campaign_enabled") is True
+            and product.get("price_verified") is True
+            and product.get("price") is not None
+            and str(product.get("stock_status") or "").lower()
+                not in {"out_of_stock", "out of stock", "unavailable", "sold_out"}
+            and len(opted_in) > 0
+        ),
+        "send_block_reason": _campaign_block_reason(product, opted_in),
+    }
+
+
+
+class CampaignSendRequest(BaseModel):
+    """An explicit, idempotent admin-triggered product offer campaign."""
+    model_config = ConfigDict(extra="forbid")
+
+    product_id: int = Field(gt=0, le=MAX_PRODUCT_ID)
+    audience_scope: str = Field(default="brand", pattern="^(brand|product)$")
+    # Reuse the same UUID when retrying the same UI action to avoid duplicate sends.
+    campaign_id: str = Field(min_length=8, max_length=80)
+
+
+def _campaign_block_reason(product: dict, eligible: list[dict]) -> Optional[str]:
+    if product.get("campaign_enabled") is not True:
+        return "Enable this product's campaign in the catalog first."
+    if product.get("price_verified") is not True:
+        return "The current price is not verified. Verify it in the dashboard first."
+    try:
+        if product.get("price") is None or float(product["price"]) <= 0:
+            return "A valid, positive catalog price is required."
+    except (TypeError, ValueError, OverflowError):
+        return "A valid, positive catalog price is required."
+    stock = _norm(product.get("stock_status"))
+    if stock in {"out of stock", "unavailable", "sold out", "outofstock"}:
+        return "This product is marked out of stock."
+    if not eligible:
+        return "No matching customers have valid explicit marketing consent."
+    return None
+
+
+def _campaign_message(product: dict) -> str:
+    name = str(product.get("title") or product.get("model") or "Product").strip()
+    brand = str(product.get("brand") or "").strip()
+    if brand and _norm(brand) not in _norm(name):
+        name = f"{brand} {name}"
+    price = float(product["price"])
+    message = f"{name} manchi offer lo undhi! Current verified price: ₹{price:,.0f}."
+    battery = str(product.get("battery_health") or "").strip()
+    if battery and _norm(battery) not in {"na", "n a", "not applicable", "unknown", "none"}:
+        message += f" Battery health: {battery}."
+    product_url = str(product.get("product_url") or "").strip()
+    if product_url.startswith(("https://", "http://")):
+        message += f" Details: {product_url}"
+    message += " Interested aa? Kindha button select cheyyandi."
+    return message[:1024]
+
+
+@router.post("/campaign-send")
+def send_campaign(
+    payload: CampaignSendRequest,
+    admin: dict = Depends(get_current_admin),
+):
+    """Send a product-specific offer to eligible matching customers.
+
+    In-window customers receive a two-button interactive message. Out-of-window
+    customers require the configured approved template with matching buttons.
+    This endpoint is intentionally manual; it does not schedule weekly sends.
+    """
+    try:
+        product_result = (
+            supabase.table("products")
+            .select(
+                "id,title,model,brand,price,battery_health,product_url,"
+                "campaign_enabled,stock_status,price_verified"
+            )
+            .eq("id", payload.product_id)
+            .limit(1)
+            .execute()
+        )
+        products = product_result.data or []
+        if not products:
+            raise HTTPException(status_code=404, detail="Product not found.")
+        product = products[0]
+        leads = _paged_select(
+            "leads",
+            "id,phone_number,product_interest,product_url,customer_data,"
+            "marketing_opt_in,marketing_opt_in_at,marketing_opt_out,"
+            "whatsapp_window_expires_at",
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise _database_error("Could not load campaign data.", exc) from exc
+
+    matched = _unique_leads([
+        lead for lead in leads
+        if _product_matches_lead(product, lead, payload.audience_scope)
+    ])
+    eligible = [
+        lead for lead in matched
+        if _has_valid_phone(lead) and _is_opted_in_at_valid_time(lead)
+    ]
+    block_reason = _campaign_block_reason(product, eligible)
+    if block_reason:
+        raise HTTPException(status_code=409, detail=block_reason)
+
+    # Validate the idempotency key format; callers should reuse it on retries.
+    try:
+        campaign_id = str(uuid.UUID(payload.campaign_id))
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(status_code=422, detail="campaign_id must be a UUID.")
+
+    title = str(product.get("title") or product.get("model") or "Product")
+    brand = str(product.get("brand") or "").strip()
+    if brand and _norm(brand) not in _norm(title):
+        title = f"{brand} {title}"
+    price_text = f"₹{float(product['price']):,.0f}"
+    battery_health_text = str(product.get("battery_health") or "Not specified").strip()
+    message = _campaign_message(product)
+    now = datetime.now(timezone.utc)
+    sent = 0
+    skipped = 0
+    failures = []
+    template_name = os.getenv("WHATSAPP_CAMPAIGN_TEMPLATE_NAME", "").strip()
+
+    for lead in eligible:
+        phone = re.sub(r"\D", "", str(lead.get("phone_number") or ""))
+        if not phone:
+            skipped += 1
+            continue
+        # Avoid duplicate delivery for a repeated request with the same campaign ID.
+        try:
+            existing = (
+                supabase.table("campaign_dispatches")
+                .select("id,status")
+                .eq("campaign_id", campaign_id)
+                .eq("phone_number", phone)
+                .limit(1)
+                .execute()
+            ).data or []
+        except Exception as exc:
+            raise _database_error(
+                "Campaign dispatch tracking is not available. Run the campaign migration first.", exc
+            ) from exc
+        if existing:
+            skipped += 1
+            continue
+
+        within_window = _has_open_customer_service_window(lead)
+        if not within_window and not template_name:
+            failures.append({"phone_number": phone, "reason": "approved_template_not_configured"})
+            continue
+
+        # Insert a pending dispatch before sending to guard concurrent/retried requests.
+        try:
+            supabase.table("campaign_dispatches").insert({
+                "campaign_id": campaign_id,
+                "product_id": int(product["id"]),
+                "phone_number": phone,
+                "status": "pending",
+            }).execute()
+        except Exception:
+            # A concurrent request may have inserted the unique key first.
+            skipped += 1
+            continue
+
+        try:
+            if within_window:
+                result = send_whatsapp_interactive_buttons(
+                    phone,
+                    message,
+                    [
+                        {"id": f"mm_campaign:{campaign_id}:{product['id']}:interested", "title": "Interested"},
+                        {"id": f"mm_campaign:{campaign_id}:{product['id']}:not_interested", "title": "Not Interested"},
+                    ],
+                )
+            else:
+                result = send_whatsapp_campaign_template(
+                    phone,
+                    product_name=title,
+                    price_text=price_text,
+                    battery_health_text=battery_health_text,
+                    campaign_id=campaign_id,
+                    product_id=int(product["id"]),
+                )
+            messages = result.get("messages") or []
+            message_id = messages[0].get("id") if messages else None
+            supabase.table("campaign_dispatches").update({
+                "status": "sent",
+                "whatsapp_message_id": message_id,
+                "sent_at": datetime.now(timezone.utc).isoformat(),
+            }).eq("campaign_id", campaign_id).eq("phone_number", phone).execute()
+            sent += 1
+        except Exception as exc:
+            logger.exception("Campaign send failed for a recipient")
+            try:
+                supabase.table("campaign_dispatches").update({
+                    "status": "failed",
+                    "failure_reason": type(exc).__name__,
+                }).eq("campaign_id", campaign_id).eq("phone_number", phone).execute()
+            except Exception:
+                logger.exception("Could not update campaign dispatch failure status")
+            failures.append({"phone_number": phone, "reason": "whatsapp_send_failed"})
+
+    return {
+        "campaign_id": campaign_id,
+        "product_id": int(product["id"]),
+        "matched_count": len(matched),
+        "eligible_count": len(eligible),
+        "sent_count": sent,
+        "skipped_count": skipped,
+        "failed_count": len(failures),
+        "failures": failures[:50],
+        "message": "Campaign processing finished. Check dispatch status before retrying.",
+    }
+
+
+@router.get("/campaign-responses")
+def list_campaign_responses(
+    product_id: Optional[int] = None,
+    response: Optional[str] = None,
+    limit: int = 100,
+    admin: dict = Depends(get_current_admin),
+):
+    """Return campaign button responses for the authenticated dashboard."""
+    if response not in (None, "interested", "not_interested"):
+        raise HTTPException(status_code=422, detail="Invalid response filter.")
+    limit = max(1, min(int(limit), 500))
+    try:
+        query = (
+            supabase.table("campaign_responses")
+            .select("id,campaign_id,product_id,phone_number,response,"
+                    "whatsapp_message_id,responded_at,created_at")
+            .order("responded_at", desc=True)
+            .limit(limit)
+        )
+        if product_id is not None:
+            query = query.eq("product_id", product_id)
+        if response is not None:
+            query = query.eq("response", response)
+        rows = query.execute().data or []
+        return {"count": len(rows), "responses": rows}
+    except Exception as exc:
+        raise _database_error(
+            "Could not load campaign responses. Run the campaign database migration first.", exc
+        ) from exc
