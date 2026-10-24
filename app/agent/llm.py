@@ -3419,6 +3419,7 @@ def _localized_fallback(
 
 # ---------------------------------------------------------
 
+
 def generate_response(
     draft_response: str,
     customer_message: str,
@@ -3428,48 +3429,83 @@ def generate_response(
     catalog_context: Optional[list] = None,
     force_llm: bool = False,
 ) -> str:
-    """Generate a grounded, context-aware WhatsApp reply when an API is configured.
+    """Generate a grounded customer reply using the configured LLM when useful.
 
-    If no provider/key is configured or the provider fails, use the existing
-    deterministic localization. The conversation and catalogue code remain the
-    source of truth; the model only writes the customer-facing wording.
+    Simple replies remain inexpensive. Catalog questions, comparisons, and
+    business-related fallback responses can invoke the model. If no provider
+    is configured or the provider fails, preserve the safe localized draft.
     """
     draft_response = (draft_response or "").strip()
     customer_message = (customer_message or "").strip()
+
     if not draft_response:
         return ""
-    if language is None:
-        language = detect_language(customer_message)
-    if language not in {"english", "telugu", "roman_telugu"}:
-        language = detect_language(customer_message)
-    if language not in {"english", "telugu", "roman_telugu"}:
-        language = "roman_telugu"
 
-    # Response rewriting is optional because the conversation layer already
-    # constructs the business decision and draft. By default, keep that draft
-    # and use deterministic localization to avoid an extra paid model request
-    # for every customer message. Set LLM_RESPONSE_REWRITE_ENABLED=true to
-    # restore model-assisted wording without changing the public API.
+    if language not in {"english", "telugu", "roman_telugu"}:
+        language = detect_language(customer_message)
+
+    customer = customer or {}
+    conversation_history = conversation_history or []
+    catalog_context = catalog_context or []
+
     rewrite_enabled = os.getenv(
         "LLM_RESPONSE_REWRITE_ENABLED", "false"
     ).strip().lower() in {"1", "true", "yes", "on"}
-    # Even when rewriting every normal response is disabled, invoke the model
-    # for a business-related fallback that indicates the deterministic handler
-    # did not understand the customer. The model receives the locked language,
-    # known customer fields, history and catalogue context; it must not invent
-    # prices/stock/policies that are absent from that context.
+
+    message_lower = customer_message.casefold()
     draft_lower = draft_response.casefold()
+
+    # Business intents that benefit from context-aware natural language.
+    business_terms = (
+        "price", "prices", "how much", "cost", "compare", "comparison",
+        "difference", "battery", "health", "second hand", "second-hand",
+        "pre-owned", "refurbished", "used phone", "storage", "variant",
+        "available", "availability", "stock", "specification", "features",
+        "warranty", "exchange", "emi", "discount", "offer", "recommend",
+        "suggest", "budget", "camera", "display", "colour", "color",
+        "ధర", "ఎంత", "బ్యాటరీ", "సెకండ్ హ్యాండ్", "పోల్చి",
+        "ధరలు", "స్టోరేజ్", "వేరియంట్", "ఫీచర్లు",
+        "entha", "cheppu", "chepu", "cheppandi", "kavali",
+        "battery health", "second hand", "used phone",
+    )
+
     fallback_markers = (
-        "didn't understand", "did not understand", "couldn't understand",
-        "could not understand", "sarigga connect cheyyaledu",
-        "mee message ni context tho", "mee message ni sarigga",
-        "what would you like to know about the phone", "which mobile model are we discussing",
-        "ye mobile model gurinchi matladuthunnamo", "ye mobile model gurinchi matladutunnamo",
+        "didn't understand",
+        "did not understand",
+        "couldn't understand",
+        "could not understand",
+        "sarigga connect cheyyaledu",
+        "mee message ni context tho",
+        "mee message ni sarigga",
+        "what would you like to know about the phone",
+        "which mobile model are we discussing",
+        "ye mobile model gurinchi matladuthunnamo",
+        "ye mobile model gurinchi matladutunnamo",
         "meeku ye mobile kavali? brand mariyu model peru cheppandi",
         "మీ మాటను సరిగా అర్థం చేసుకోలేదు",
+        "exact matching variant current catalog lo kanipinchaledu",
+        "exact variant maa demo catalog lo dorakaledu",
     )
-    fallback_needs_llm = any(marker in draft_lower for marker in fallback_markers)
-    if not rewrite_enabled and not fallback_needs_llm and not force_llm:
+
+    fallback_needs_llm = any(
+        marker in draft_lower for marker in fallback_markers
+    )
+    is_business_question = any(
+        term in message_lower for term in business_terms
+    )
+
+    # Catalog-backed questions should be generated dynamically, but only when
+    # context exists. Without context, the model must not invent catalog facts.
+    has_catalog_context = bool(catalog_context)
+
+    should_call_llm = (
+        force_llm
+        or rewrite_enabled
+        or fallback_needs_llm
+        or (is_business_question and has_catalog_context)
+    )
+
+    if not should_call_llm:
         return _localized_fallback(
             draft_response=draft_response,
             language=language,
@@ -3484,30 +3520,50 @@ def generate_response(
         conversation_history=conversation_history,
         catalog_context=catalog_context,
     )
+
     generated = _call_text_model(
         BUSINESS_SYSTEM_PROMPT,
         prompt,
         temperature=0.35,
         json_mode=False,
     )
-    if generated:
-        generated = generated.strip().strip('"')
-        # Guard against language-script drift. Keep product names and model
-        # acronyms, but don't return a full response in the wrong script.
-        has_telugu_script = bool(re.search(r"[\u0C00-\u0C7F]", generated))
-        roman_markers = re.search(
-            r"\b(meeku|mee|kavali|undi|undhi|ledu|cheppandi|chesi|chestha|"
-            r"parledhu|sare|konali|entha|ela|inka|kosam|chesukondi|"
-            r"avuthundi|avutundi|chudandi|help chestha)\b",
-            generated.lower(),
+
+    if not generated:
+        return _localized_fallback(
+            draft_response=draft_response,
+            language=language,
+            customer=customer,
         )
-        if language == "telugu" and has_telugu_script:
-            return generated[:1800]
-        if language == "roman_telugu" and not has_telugu_script and roman_markers:
-            return generated[:1800]
-        if language == "english" and not has_telugu_script and not roman_markers:
-            return generated[:1800]
-        # If the provider returns the wrong language/script, use the safe fallback.
+
+    generated = generated.strip().strip('"')
+    if not generated:
+        return _localized_fallback(
+            draft_response=draft_response,
+            language=language,
+            customer=customer,
+        )
+
+    # Keep the response language consistent with the customer's first-message
+    # language policy. Product names, model numbers and technical terms remain
+    # permitted in Latin characters in Telugu-language responses.
+    has_telugu_script = bool(
+        re.search(r"[\u0C00-\u0C7F]", generated)
+    )
+    roman_markers = re.search(
+        r"\b(meeku|mee|kavali|undi|undhi|ledu|cheppandi|chesi|chestha|"
+        r"parledhu|sare|konali|entha|ela|inka|kosam|chesukondi|"
+        r"avuthundi|avutundi|chudandi|help chestha)\b",
+        generated.lower(),
+    )
+
+    if language == "telugu" and has_telugu_script:
+        return generated[:1800]
+
+    if language == "roman_telugu" and not has_telugu_script and roman_markers:
+        return generated[:1800]
+
+    if language == "english" and not has_telugu_script and not roman_markers:
+        return generated[:1800]
 
     return _localized_fallback(
         draft_response=draft_response,

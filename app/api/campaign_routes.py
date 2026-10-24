@@ -435,6 +435,7 @@ def update_product(
         "product": rows[0],
     }
 
+
 @router.post("/campaign-preview")
 def campaign_preview(
     payload: CampaignPreviewRequest,
@@ -492,7 +493,6 @@ def campaign_preview(
     )
 
     # A campaign must not be enabled merely because a preview can be created.
-    # Sending is disabled in this phase.
     opted_in = [
         lead
         for lead in matched
@@ -517,6 +517,15 @@ def campaign_preview(
         if lead not in within_window
     ]
 
+    send_block_reason = _campaign_block_reason(product, opted_in)
+
+    if send_block_reason is None and not within_window and opted_in:
+        send_block_reason = (
+            "No opted-in recipients currently have an open 24-hour WhatsApp "
+            "customer-service window. Configure and integrate an approved Meta "
+            "marketing template before contacting out-of-window recipients."
+        )
+
     return {
         "product": {
             "id": product["id"],
@@ -538,60 +547,101 @@ def campaign_preview(
             product.get("campaign_enabled") is True
             and product.get("price_verified") is True
             and product.get("price") is not None
-            and str(product.get("stock_status") or "").lower()
-                not in {"out_of_stock", "out of stock", "unavailable", "sold_out"}
-            and len(opted_in) > 0
+            and _norm(product.get("stock_status")) not in {
+                "out of stock",
+                "unavailable",
+                "sold out",
+                "outofstock",
+            }
+            and len(within_window) > 0
         ),
-        "send_block_reason": _campaign_block_reason(product, opted_in),
+        "send_block_reason": send_block_reason,
     }
-
 
 
 class CampaignSendRequest(BaseModel):
     """An explicit, idempotent admin-triggered product offer campaign."""
+
     model_config = ConfigDict(extra="forbid")
 
     product_id: int = Field(gt=0, le=MAX_PRODUCT_ID)
-    audience_scope: str = Field(default="brand", pattern="^(brand|product)$")
+    audience_scope: str = Field(
+        default="brand",
+        pattern="^(brand|product)$",
+    )
     # Reuse the same UUID when retrying the same UI action to avoid duplicate sends.
     campaign_id: str = Field(min_length=8, max_length=80)
 
 
-def _campaign_block_reason(product: dict, eligible: list[dict]) -> Optional[str]:
+def _campaign_block_reason(
+    product: dict,
+    eligible: list[dict],
+) -> Optional[str]:
     if product.get("campaign_enabled") is not True:
         return "Enable this product's campaign in the catalog first."
+
     if product.get("price_verified") is not True:
         return "The current price is not verified. Verify it in the dashboard first."
+
     try:
         if product.get("price") is None or float(product["price"]) <= 0:
             return "A valid, positive catalog price is required."
     except (TypeError, ValueError, OverflowError):
         return "A valid, positive catalog price is required."
+
     stock = _norm(product.get("stock_status"))
-    if stock in {"out of stock", "unavailable", "sold out", "outofstock"}:
+
+    if stock in {
+        "out of stock",
+        "unavailable",
+        "sold out",
+        "outofstock",
+    }:
         return "This product is marked out of stock."
+
     if not eligible:
         return "No matching customers have valid explicit marketing consent."
+
     return None
 
 
 def _campaign_message(product: dict) -> str:
-    name = str(product.get("title") or product.get("model") or "Product").strip()
+    name = str(
+        product.get("title") or product.get("model") or "Product"
+    ).strip()
+
     brand = str(product.get("brand") or "").strip()
+
     if brand and _norm(brand) not in _norm(name):
         name = f"{brand} {name}"
+
     price = float(product["price"])
-    message = f"{name} manchi offer lo undhi! Current verified price: ₹{price:,.0f}."
+    message = (
+        f"{name} manchi offer lo undhi! "
+        f"Current verified price: ₹{price:,.0f}."
+    )
+
     battery = str(product.get("battery_health") or "").strip()
-    if battery and _norm(battery) not in {"na", "n a", "not applicable", "unknown", "none"}:
+
+    if battery and _norm(battery) not in {
+        "na",
+        "n a",
+        "not applicable",
+        "unknown",
+        "none",
+    }:
         message += f" Battery health: {battery}."
+
     product_url = str(product.get("product_url") or "").strip()
+
     if product_url.startswith(("https://", "http://")):
         message += f" Details: {product_url}"
+
     message += (
         " Interest unte INTERESTED ani reply cheyyandi. "
         "Promotional messages aapadaniki STOP ani reply cheyyandi."
     )
+
     return message[:1024]
 
 
@@ -617,38 +667,80 @@ def send_campaign(
             .limit(1)
             .execute()
         )
+
         products = product_result.data or []
+
         if not products:
-            raise HTTPException(status_code=404, detail="Product not found.")
+            raise HTTPException(
+                status_code=404,
+                detail="Product not found.",
+            )
+
         product = products[0]
+
         leads = _paged_select(
             "leads",
             "id,phone_number,product_interest,product_url,customer_data,"
             "marketing_opt_in,marketing_opt_in_at,marketing_opt_out,"
             "whatsapp_window_expires_at",
         )
+
     except HTTPException:
         raise
     except Exception as exc:
-        raise _database_error("Could not load campaign data.", exc) from exc
+        raise _database_error(
+            "Could not load campaign data.",
+            exc,
+        ) from exc
 
     matched = _unique_leads([
-        lead for lead in leads
-        if _product_matches_lead(product, lead, payload.audience_scope)
+        lead
+        for lead in leads
+        if _product_matches_lead(
+            product,
+            lead,
+            payload.audience_scope,
+        )
     ])
+
     eligible = [
-        lead for lead in matched
-        if _has_valid_phone(lead) and _is_opted_in_at_valid_time(lead)
+        lead
+        for lead in matched
+        if _has_valid_phone(lead)
+        and _is_opted_in_at_valid_time(lead)
     ]
+
     block_reason = _campaign_block_reason(product, eligible)
+
     if block_reason:
-        raise HTTPException(status_code=409, detail=block_reason)
+        raise HTTPException(
+            status_code=409,
+            detail=block_reason,
+        )
+
+    # Preview data may be stale by the time the administrator clicks Send.
+    # Recheck the 24-hour window immediately before starting any delivery.
+    if not any(
+        _has_open_customer_service_window(lead)
+        for lead in eligible
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "No eligible opted-in customers have an open 24-hour WhatsApp "
+                "window. Out-of-window recipients require an approved Meta "
+                "marketing template, which is not enabled in this route."
+            ),
+        )
 
     # Validate the idempotency key format; callers should reuse it on retries.
     try:
         campaign_id = str(uuid.UUID(payload.campaign_id))
     except (ValueError, AttributeError, TypeError):
-        raise HTTPException(status_code=422, detail="campaign_id must be a UUID.")
+        raise HTTPException(
+            status_code=422,
+            detail="campaign_id must be a UUID.",
+        )
 
     message = _campaign_message(product)
     sent = 0
@@ -656,10 +748,16 @@ def send_campaign(
     failures = []
 
     for lead in eligible:
-        phone = re.sub(r"\D", "", str(lead.get("phone_number") or ""))
+        phone = re.sub(
+            r"\D",
+            "",
+            str(lead.get("phone_number") or ""),
+        )
+
         if not phone:
             skipped += 1
             continue
+
         # Avoid duplicate delivery for a repeated request with the same campaign ID.
         try:
             existing = (
@@ -670,23 +768,26 @@ def send_campaign(
                 .limit(1)
                 .execute()
             ).data or []
+
         except Exception as exc:
             raise _database_error(
-                "Campaign dispatch tracking is not available. Run the campaign migration first.", exc
+                "Campaign dispatch tracking is not available. Run the campaign migration first.",
+                exc,
             ) from exc
+
         if existing:
             skipped += 1
             continue
 
-        within_window = _has_open_customer_service_window(lead)
-        if not within_window:
-            # Never send free-form marketing text outside the 24-hour window.
-            # A correctly configured, approved Meta Marketing template is
-            # required; this route intentionally does not guess its name/body.
+        # Never send free-form marketing text outside the 24-hour window.
+        # Recheck the timestamp immediately before dispatch.
+        if not _has_open_customer_service_window(lead):
             skipped += 1
             failures.append({
                 "phone_number": phone,
-                "reason": "outside_24h_window_approved_marketing_template_required",
+                "reason": (
+                    "outside_24h_window_approved_marketing_template_required"
+                ),
             })
             continue
 
@@ -698,6 +799,7 @@ def send_campaign(
                 "phone_number": phone,
                 "status": "pending",
             }).execute()
+
         except Exception:
             # A concurrent request may have inserted the unique key first.
             skipped += 1
@@ -707,22 +809,47 @@ def send_campaign(
             result = send_whatsapp_message(phone, message)
             messages = result.get("messages") or []
             message_id = messages[0].get("id") if messages else None
+
+            # A successful HTTP response without a message ID is unusual.
+            # Keep the provider result for diagnostics, but don't log phone numbers.
             supabase.table("campaign_dispatches").update({
                 "status": "sent",
                 "whatsapp_message_id": message_id,
                 "sent_at": datetime.now(timezone.utc).isoformat(),
-            }).eq("campaign_id", campaign_id).eq("phone_number", phone).execute()
+            }).eq(
+                "campaign_id",
+                campaign_id,
+            ).eq(
+                "phone_number",
+                phone,
+            ).execute()
+
             sent += 1
+
         except Exception as exc:
             logger.exception("Campaign send failed for a recipient")
+
             try:
                 supabase.table("campaign_dispatches").update({
                     "status": "failed",
                     "failure_reason": type(exc).__name__,
-                }).eq("campaign_id", campaign_id).eq("phone_number", phone).execute()
+                }).eq(
+                    "campaign_id",
+                    campaign_id,
+                ).eq(
+                    "phone_number",
+                    phone,
+                ).execute()
+
             except Exception:
-                logger.exception("Could not update campaign dispatch failure status")
-            failures.append({"phone_number": phone, "reason": "whatsapp_send_failed"})
+                logger.exception(
+                    "Could not update campaign dispatch failure status"
+                )
+
+            failures.append({
+                "phone_number": phone,
+                "reason": "whatsapp_send_failed",
+            })
 
     return {
         "campaign_id": campaign_id,
@@ -733,7 +860,9 @@ def send_campaign(
         "skipped_count": skipped,
         "failed_count": len(failures),
         "failures": failures[:50],
-        "message": "Campaign processing finished. Check dispatch status before retrying.",
+        "message": (
+            "Campaign processing finished. Check dispatch status before retrying."
+        ),
     }
 
 
@@ -746,23 +875,39 @@ def list_campaign_responses(
 ):
     """Return text-reply campaign responses for the authenticated dashboard."""
     if response not in (None, "interested", "not_interested"):
-        raise HTTPException(status_code=422, detail="Invalid response filter.")
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid response filter.",
+        )
+
     limit = max(1, min(int(limit), 500))
+
     try:
         query = (
             supabase.table("campaign_responses")
-            .select("id,campaign_id,product_id,phone_number,response,"
-                    "whatsapp_message_id,responded_at,created_at")
+            .select(
+                "id,campaign_id,product_id,phone_number,response,"
+                "whatsapp_message_id,responded_at,created_at"
+            )
             .order("responded_at", desc=True)
             .limit(limit)
         )
+
         if product_id is not None:
             query = query.eq("product_id", product_id)
+
         if response is not None:
             query = query.eq("response", response)
+
         rows = query.execute().data or []
-        return {"count": len(rows), "responses": rows}
+
+        return {
+            "count": len(rows),
+            "responses": rows,
+        }
+
     except Exception as exc:
         raise _database_error(
-            "Could not load campaign responses. Run the campaign database migration first.", exc
+            "Could not load campaign responses. Run the campaign database migration first.",
+            exc,
         ) from exc
