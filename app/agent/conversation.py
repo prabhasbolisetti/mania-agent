@@ -4663,13 +4663,13 @@ def _process_message_serialized(customer_id: str, message: str) -> dict:
             )
         elif language == "telugu":
             greeting_reply = (
-                "హాయ్! Mania Mobiles కి స్వాగతం 😊 మొబైల్ మోడళ్లు, ధరలు, కలర్లు, స్టోరేజ్ ఆప్షన్లలో సహాయం చేస్తాను. మీకు ఏ మొబైల్ గురించి తెలుసుకోవాలి? ఏ బ్రాండ్/మోడల్ అయినా చెప్పండి.\nWhatsApp లో ఆఫర్లు కావాలంటే START అని సందేశం పంపండి. ఆపడానికి ఎప్పుడైనా STOP అని సందేశం పంపవచ్చు."
+                "హాయ్! Mania Mobiles కి స్వాగతం 😊 మీకు ఏ మొబైల్ గురించి తెలుసుకోవాలి? ఏ బ్రాండ్/మోడల్ అయినా చెప్పండి."
                 if previous_history_len == 0
                 else "హాయ్ 😊 Mania Mobiles మొబైల్ వివరాల్లో సహాయం చేస్తాను. మీరు చూస్తున్న బ్రాండ్/మోడల్ పేరు చెప్పండి."
             )
         else:
             greeting_reply = (
-                "Hi! Mania Mobiles ki welcome 😊 Mobile models, prices, colors, storage options lo help chestha. Meeku ye mobile gurinchi telusukovali? Ye brand/model aina cheppandi.\nOccasional promotional WhatsApp offers kavali ante START ani reply ivvandi. Aapadaniki eppudaina STOP ani reply ivvachu."
+                "Hi! Mania Mobiles ki welcome 😊 Meeru ye mobile gurinchi telusukovali? Ye brand/model aina cheppandi."
                 if previous_history_len == 0
                 else "Hi 😊 Mania Mobiles mobile details lo help chestha. Ye brand/model chusthunnaru?"
             )
