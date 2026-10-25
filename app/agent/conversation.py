@@ -759,6 +759,69 @@ def _catalog_stock_text(product: dict, language: str) -> str:
     return "స్టాక్‌ను స్టోర్‌తో నిర్ధారించాలి" if language == "telugu" else "stock store tho confirm cheyyali"
 
 
+def _compact_price(product: dict) -> str:
+    """Short price for WhatsApp lists. Unverified prices are flagged, never hidden."""
+    try:
+        text = f"₹{float(product.get('price_inr')):,.0f}"
+    except (TypeError, ValueError):
+        return "price store tho confirm"
+    return text if product.get("price_needs_verification") is False else text + "*"
+
+
+def _compact_option_line(product: dict, fallback_name: str = "") -> str:
+    """One short line: name, price, colour, battery health. No link, no stock text."""
+    name = str(product.get("product_name") or fallback_name).strip()
+    parts = [_compact_price(product)]
+    color = _catalog_color(product)
+    if color and color.casefold() not in name.casefold():
+        parts.append(color)
+    battery = _catalog_battery_health(product)
+    if battery and battery.lower() not in {"unknown", "n/a", "na", "none"}:
+        parts.append(f"Battery {battery if '%' in battery else battery + '%'}")
+    return f"• {name} — " + " | ".join(parts)
+
+
+def _compact_list_note(items: list, language: str) -> str:
+    unverified = any(item.get("price_needs_verification") is not False for item in items)
+    if language == "telugu":
+        return ("* ధర స్టోర్‌తో నిర్ధారించాలి." if unverified else "తాజా ధర, స్టాక్‌ను స్టోర్‌తో నిర్ధారించండి.")
+    return ("* price store tho confirm cheyyali." if unverified else "Latest price/stock store tho confirm cheyyandi.")
+
+
+MAX_LIST_OPTIONS = 5
+
+
+def _purchase_link_line(customer: dict, language: str) -> str:
+    """The single product link, sent only once the customer confirms buying.
+
+    Returns "" unless the customer's chosen variant resolves to exactly one
+    catalogue product with a real URL; a link is never guessed.
+    """
+    model = str(customer.get("model") or customer.get("product_interest") or "").strip()
+    if not model:
+        return ""
+    try:
+        items = _catalog_products_for_model(
+            model,
+            storage=str(customer.get("storage") or ""),
+            color=str(customer.get("color") or customer.get("colour") or ""),
+        )
+    except Exception as exc:
+        print("Purchase link lookup failed:", type(exc).__name__)
+        return ""
+    urls = {
+        str(item.get("product_url") or "").strip()
+        for item in items
+        if str(item.get("product_url") or "").strip().startswith(("https://", "http://"))
+    }
+    if len(urls) != 1:
+        return ""
+    url = next(iter(urls))
+    if language == "telugu":
+        return f"మీరు వెబ్‌సైట్ నుండి కూడా ఆర్డర్ చేయవచ్చు: {url}"
+    return f"Website nundi kuda order chesukovachu: {url}"
+
+
 def _catalog_model_options_message(model: str, language: str, storage: str = "") -> str:
     """Summarize only catalog-backed storage/color options and listed prices."""
     items = _catalog_products_for_model(model, storage=storage)
@@ -766,31 +829,24 @@ def _catalog_model_options_message(model: str, language: str, storage: str = "")
         if language == "telugu":
             return f"{model} మా డెమో కాటలాగ్‌లో ఉంది అని నిర్ధారించలేకపోయాను. సరైన వేరియంట్, ధర, స్టాక్‌ను స్టోర్‌తో నిర్ధారించాలి."
         return f"{model} exact variants maa demo catalog lo dorakaledu. Correct variant, price, stock store tho confirm cheyyali."
-    lines = []
-    seen = set()
+    lines, seen = [], set()
     for item in items:
-        name = str(item.get("product_name") or model).strip()
-        url = str(item.get("product_url") or "").strip()
-        price = _catalog_price_text(item, language)
-        stock = _catalog_stock_text(item, language)
-        line = f"• {name} — {price}; {stock}"
-        if url.startswith(("https://", "http://")):
-            line += f"\n  {url}"
+        line = _compact_option_line(item, model)
         if line not in seen:
             seen.add(line)
             lines.append(line)
-        if len(lines) >= 8:
+        if len(lines) >= MAX_LIST_OPTIONS:
             break
     if language == "telugu":
         title = f"{model} కోసం కాటలాగ్‌లో కనిపించిన వేరియంట్లు:"
         ask = (f"మీకు {storage}లో ఏ కలర్ కావాలి?" if storage else "మీకు ఏ స్టోరేజ్, కలర్ కావాలి?")
         budget = "మీ బడ్జెట్ ఎంత అనుకుంటున్నారు?"
-        note = "గమనిక: ఇవి కాటలాగ్ వివరాలు మాత్రమే; తాజా ధర, స్టాక్‌ను స్టోర్‌తో నిర్ధారించాలి."
+        note = _compact_list_note(items, language)
     else:
         title = f"{model} ki catalog lo kanipinchina variants:"
         ask = (f"{storage} lo ye color kavali?" if storage else "Ye storage, color kavali?")
         budget = "Mee budget entha anukuntunnaru?"
-        note = "Note: ivi catalog details matrame; latest price/stock store tho confirm cheyyali."
+        note = _compact_list_note(items, language)
     return title + "\n" + "\n".join(lines) + "\n\n" + note + "\n\n" + ask + "\n" + budget
 
 
@@ -853,32 +909,22 @@ def _catalog_options_only_message(model: str, language: str, storage: str = "", 
     items = sorted(items, key=sort_key)
     lines, seen = [], set()
     for item in items:
-        name = str(item.get("product_name") or model).strip()
-        storage_label = _catalog_storage(item)
-        color_label = _catalog_color(item)
-        condition = _catalog_condition(item)
-        battery = _catalog_battery_health(item)
-        details = [x for x in (storage_label, color_label, condition) if x]
-        if battery and battery.lower() not in {"unknown", "n/a", "na", "none"}:
-            details.append(f"Battery health {battery}")
-        label = f"{name} ({'; '.join(details)})" if details else name
-        line = f"• {label} — {_catalog_price_text(item, language)}; {_catalog_stock_text(item, language)}"
-        url = str(item.get("product_url") or "").strip()
-        if url.startswith(("https://", "http://")):
-            line += f"\n  {url}"
+        line = _compact_option_line(item, model)
         if line not in seen:
             seen.add(line)
             lines.append(line)
-        if len(lines) >= 10:
-            break
+    extra = max(0, len(lines) - MAX_LIST_OPTIONS)
+    lines = lines[:MAX_LIST_OPTIONS]
+    if extra:
+        lines.append(f"+{extra} inka options unnayi" if not telugu else f"+{extra} ఇంకా ఆప్షన్లు ఉన్నాయి")
 
     if telugu:
         title = f"{model} kosam catalog lo dorikina options (used phones takkuva price nunchi; brand-new last lo):"
-        note = "Note: catalog details matrame. Latest price, battery health, stock store tho confirm cheyyali."
+        note = _compact_list_note(items, language)
         ask = "Veetilo meeku ye option kavali bro?"
     else:
         title = f"{model} ki catalog lo dorikina options (used phones low-to-high price; brand-new last):"
-        note = "Note: catalog details only. Latest price, battery health and stock should be confirmed with the store."
+        note = _compact_list_note(items, language)
         ask = "Veetilo meeku ye option kavali bro?"
     return title + "\n" + "\n".join(lines) + "\n\n" + note + "\n\n" + ask
 
@@ -996,13 +1042,7 @@ def _get_product_message(
                 option_lines = []
                 for storage_value, item in storage_options[:5]:
                     item_name = str(item.get("product_name") or item.get("model") or model).strip()
-                    option_lines.append(
-                        f"- {storage_value}: {_catalog_price_text(item, language)}; "
-                        f"{_catalog_stock_text(item, language)}"
-                    )
-                    item_url = str(item.get("product_url") or "").strip()
-                    if item_url.startswith(("https://", "http://")):
-                        option_lines[-1] += f"; {item_url}"
+                    option_lines.append(f"- {storage_value}: {_compact_price(item)}")
                 return title + "\\n" + "\\n".join(option_lines)
 
         if matches:
@@ -1011,20 +1051,11 @@ def _get_product_message(
             url = str(product.get("product_url") or "").strip()
             price = _catalog_price_text(product, language)
             stock = _catalog_stock_text(product, language)
-            condition = str((product.get("attributes") or {}).get("condition") or "").strip()
-            condition_note = ""
-            if condition:
-                condition_note = (f"\nకాటలాగ్‌లో condition: {condition} (స్టోర్‌తో నిర్ధారించాలి)" if is_telugu
-                                  else f"\nCatalog condition: {condition} (store tho confirm cheyyali)")
+            line = _compact_option_line(product, product_interest)[2:]
+            note = _compact_list_note([product], language)
             if is_telugu:
-                result = f"మీరు అడిగిన ప్రోడక్ట్: {name}\n{price}\n{stock}{condition_note}"
-                if url.startswith(("https://", "http://")):
-                    result += f"\nడైరెక్ట్ లింక్: {url}"
-                return result
-            result = f"Mee product: {name}\n{price}\n{stock}{condition_note}"
-            if url.startswith(("https://", "http://")):
-                result += f"\nDirect link: {url}"
-            return result
+                return f"మీరు అడిగిన ప్రోడక్ట్: {line}\n{note}"
+            return f"Mee product: {line}\n{note}"
         if is_telugu:
             return "ఈ ఖచ్చితమైన వేరియంట్ మా డెమో కాటలాగ్‌లో కనిపించలేదు. ధర, స్టాక్‌ను స్టోర్‌తో నిర్ధారించాలి."
         return "Ee exact variant maa demo catalog lo dorakaledu. Price mariyu stock store tho confirm cheyyali."
@@ -3918,10 +3949,16 @@ def _process_message_impl(
         final_messages = [
             "ధన్యవాదాలు బ్రో 😊 మీ కొనుగోలు ఆసక్తిని నమోదు చేశాము. ధర, స్టాక్ నిర్ధారించడానికి మా టీమ్ మిమ్మల్ని సంప్రదించవచ్చు. ఇంకా ఏ మొబైల్ గురించి తెలుసుకోవాలన్నా మెసేజ్ చేయండి."
         ]
+        _link = _purchase_link_line(customer, "telugu")
+        if _link:
+            final_messages[0] += "\n\n" + _link
     elif final_intent_kind == "positive":
         final_messages = [
             "Dhanyavaadalu bro 😊 Mee purchase interest note chesam. Price, stock confirm cheyadaniki maa team mimmalni contact avvachu. Inka ye mobile gurinchi telusukovalanna message cheyyandi."
         ]
+        _link = _purchase_link_line(customer, "roman_telugu")
+        if _link:
+            final_messages[0] += "\n\n" + _link
     elif session.get("language") == "telugu":
 
         final_messages = [
@@ -4347,14 +4384,18 @@ def _saved_purchase_acknowledgement(message: str, customer: dict, language: str)
         if kind == "compare":
             return f"అర్థమైంది 😊 మీరు ప్రస్తుతం మోడళ్లను పోల్చి చూస్తున్నారని నమోదు చేశాను. మీ వివరాలు ఇప్పటికే సేవ్ అయ్యాయి; అదే ప్రశ్న మళ్లీ అడగను."
         if kind == "positive":
-            return f"సరే 😊 మీ కొనుగోలు ఆసక్తిని నమోదు చేశాను. {product_label}, బడ్జెట్ {budget_text}. తాజా ధర, స్టాక్‌ను Mania Mobiles స్టోర్‌తో నిర్ధారించాలి."
+            link = _purchase_link_line(customer, language)
+            return (f"సరే 😊 మీ కొనుగోలు ఆసక్తిని నమోదు చేశాను. {product_label}, బడ్జెట్ {budget_text}. తాజా ధర, స్టాక్‌ను Mania Mobiles స్టోర్‌తో నిర్ధారించాలి."
+                    + (f"\n\n{link}" if link else ""))
         return "మీ వివరాలు ఇప్పటికే నమోదు చేశాను 😊 Mania Mobiles మొబైల్ వివరాల్లో మీకు సహాయం చేస్తాను."
     if kind == "price_concern":
         return f"Ardham ayyindi bro 😊 {product_label} price mee {budget_text} budget ki ekkuva anipisthondi. Latest price/stock store tho confirm cheyyali; mee budget lo fit ayye alternatives ni compare cheyochu."
     if kind == "compare":
         return "Ardham ayyindi bro 😊 Ippatiki models compare chesthunnaru ani note chesanu. Mee details already save ayyayi; ade question malli adaganu."
     if kind == "positive":
-        return f"Sare bro 😊 Mee purchase interest note chesanu. {product_label}, budget {budget_text}. Latest price/stock Mania Mobiles store tho confirm cheyyali."
+        link = _purchase_link_line(customer, language)
+        return (f"Sare bro 😊 Mee purchase interest note chesanu. {product_label}, budget {budget_text}. Latest price/stock Mania Mobiles store tho confirm cheyyali."
+                + (f"\n\n{link}" if link else ""))
     return "Mee details already note chesanu bro 😊 Mania Mobiles mobile details lo help chestha."
 
 
