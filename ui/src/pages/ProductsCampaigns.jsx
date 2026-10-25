@@ -1,10 +1,22 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+
+import { useEffect, useMemo, useState, useCallback } from "react";
 import "./ProductsCampaigns.css";
 
 const API = "/api/products-campaigns";
 
-async function apiRequest(path, options = {}) {
-  const response = await fetch(`${API}/${String(path).replace(/^\/+/, "")}`, {
+/**
+ * Normalize appended paths so "/products" and "products"
+ * both produce a single-slash API URL.
+ */
+function normalizeApiPath(path = "") {
+  const cleanPath = String(path).replace(/^\/+/, "");
+  return cleanPath ? `/${cleanPath}` : "";
+}
+
+async function apiRequest(path = "", options = {}) {
+  const url = `${API}${normalizeApiPath(path)}`;
+
+  const response = await fetch(url, {
     ...options,
     credentials: "include",
     headers: {
@@ -13,30 +25,25 @@ async function apiRequest(path, options = {}) {
     },
   });
 
-  const data = await response.json().catch(() => ({}));
+  const body = await response.json().catch(() => ({}));
 
   if (!response.ok) {
-    const message =
-      response.status === 401
-        ? "Your session expired. Please sign in again."
-        : response.status === 403
-          ? "You don't have permission to perform this action."
-          : data.detail || data.message || `Request failed (${response.status}).`;
+    if (response.status === 401) {
+      throw new Error("Your session expired. Please sign in again.");
+    }
 
-    throw new Error(message);
+    if (response.status === 403) {
+      throw new Error("You don't have permission to perform this action.");
+    }
+
+    throw new Error(
+      body.detail ||
+        body.message ||
+        `Request failed with status ${response.status}.`
+    );
   }
 
-  return data;
-}
-
-function getProductName(product) {
-  return product?.title || product?.model || "Unnamed product";
-}
-
-function getErrorMessage(error) {
-  return error instanceof Error
-    ? error.message
-    : "Something went wrong. Please try again.";
+  return body;
 }
 
 function formatPrice(value) {
@@ -45,7 +52,10 @@ function formatPrice(value) {
   }
 
   const number = Number(value);
-  if (!Number.isFinite(number)) return "Not set";
+
+  if (!Number.isFinite(number)) {
+    return "Not set";
+  }
 
   return new Intl.NumberFormat("en-IN", {
     style: "currency",
@@ -54,36 +64,26 @@ function formatPrice(value) {
   }).format(number);
 }
 
+function getProductName(product) {
+  return product.title || product.model || "Unnamed product";
+}
+
+function getErrorMessage(error) {
+  return error instanceof Error
+    ? error.message
+    : "Something went wrong. Please try again.";
+}
+
 function createCampaignId() {
   if (globalThis.crypto?.randomUUID) {
     return globalThis.crypto.randomUUID();
   }
 
   return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (char) => {
-    const random = Math.floor(Math.random() * 16);
-    return (char === "x" ? random : (random & 3) | 8).toString(16);
+    const random = Math.random() * 16 | 0;
+    const value = char === "x" ? random : (random & 0x3) | 0x8;
+    return value.toString(16);
   });
-}
-
-function maskPhone(value) {
-  const digits = String(value || "").replace(/\D/g, "");
-  if (digits.length < 5) return "Hidden";
-  return `${"•".repeat(Math.max(0, digits.length - 4))}${digits.slice(-4)}`;
-}
-
-function formatDate(value) {
-  if (!value) return "—";
-  const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? "—" : date.toLocaleString();
-}
-
-function Stat({ label, value }) {
-  return (
-    <div>
-      <span>{label}</span>
-      <strong>{value ?? 0}</strong>
-    </div>
-  );
 }
 
 export default function ProductsCampaigns() {
@@ -93,56 +93,37 @@ export default function ProductsCampaigns() {
   const [savingId, setSavingId] = useState(null);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
-
-  const [scope, setScope] = useState("brand");
   const [preview, setPreview] = useState(null);
+  const [scope, setScope] = useState("brand");
   const [previewLoading, setPreviewLoading] = useState(false);
-  const [sending, setSending] = useState(false);
+  const [sendingCampaign, setSendingCampaign] = useState(false);
+  const [verifyingPriceId, setVerifyingPriceId] = useState(null);
   const [campaignResult, setCampaignResult] = useState(null);
 
-  const [responses, setResponses] = useState([]);
-  const [responsesLoading, setResponsesLoading] = useState(true);
-  const [responsesError, setResponsesError] = useState("");
-
-  // Reuse the same ID when retrying a request whose outcome was uncertain.
-  const campaignIdRef = useRef(null);
-
-  const loadProducts = useCallback(async ({ quiet = false } = {}) => {
-    if (!quiet) setLoading(true);
+  const loadProducts = useCallback(async () => {
+    setLoading(true);
     setError("");
 
     try {
-      const data = await apiRequest("products");
+      const data = await apiRequest("/products");
       setProducts(Array.isArray(data.products) ? data.products : []);
     } catch (err) {
       setError(getErrorMessage(err));
     } finally {
-      if (!quiet) setLoading(false);
-    }
-  }, []);
-
-  const loadResponses = useCallback(async () => {
-    setResponsesLoading(true);
-    setResponsesError("");
-
-    try {
-      const data = await apiRequest("campaign-responses?limit=100");
-      setResponses(Array.isArray(data.responses) ? data.responses : []);
-    } catch (err) {
-      setResponsesError(getErrorMessage(err));
-    } finally {
-      setResponsesLoading(false);
+      setLoading(false);
     }
   }, []);
 
   useEffect(() => {
     loadProducts();
-    loadResponses();
-  }, [loadProducts, loadResponses]);
+  }, [loadProducts]);
 
   const filteredProducts = useMemo(() => {
     const needle = search.trim().toLowerCase();
-    if (!needle) return products;
+
+    if (!needle) {
+      return products;
+    }
 
     return products.filter((product) =>
       [
@@ -150,29 +131,18 @@ export default function ProductsCampaigns() {
         product.model,
         product.brand,
         product.sku,
-      ].some((value) => String(value || "").toLowerCase().includes(needle))
+      ].some((value) =>
+        String(value || "").toLowerCase().includes(needle)
+      )
     );
   }, [products, search]);
-
-  const enabledCampaignCount = useMemo(
-    () => products.filter((product) => Boolean(product.campaign_enabled)).length,
-    [products]
-  );
-
-  const totalBrandInterest = useMemo(
-    () =>
-      products.reduce(
-        (total, product) =>
-          total + (Number(product.brand_interest_count) || 0),
-        0
-      ),
-    [products]
-  );
 
   const editLocal = useCallback((id, field, value) => {
     setProducts((current) =>
       current.map((product) =>
-        product.id === id ? { ...product, [field]: value } : product
+        product.id === id
+          ? { ...product, [field]: value }
+          : product
       )
     );
   }, []);
@@ -197,19 +167,21 @@ export default function ProductsCampaigns() {
     }
 
     try {
-      await apiRequest(`products/${encodeURIComponent(product.id)}`, {
+      const body = {
+        price: numericPrice,
+        battery_health: product.battery_health ?? "",
+        campaign_enabled: Boolean(product.campaign_enabled),
+      };
+
+      await apiRequest(`/products/${encodeURIComponent(product.id)}`, {
         method: "PATCH",
-        body: JSON.stringify({
-          price: numericPrice,
-          battery_health: product.battery_health ?? "",
-          campaign_enabled: Boolean(product.campaign_enabled),
-        }),
+        body: JSON.stringify(body),
       });
 
-      setNotice(
-        `Saved ${getProductName(product)}. If its price changed, verify it again before running a campaign.`
-      );
-      await loadProducts({ quiet: true });
+      setNotice(`Saved ${getProductName(product)}.`);
+      setPreview(null);
+      setCampaignResult(null);
+      await loadProducts();
     } catch (err) {
       setError(getErrorMessage(err));
     } finally {
@@ -222,11 +194,9 @@ export default function ProductsCampaigns() {
     setError("");
     setNotice("");
     setPreview(null);
-    setCampaignResult(null);
-    campaignIdRef.current = null;
 
     try {
-      const data = await apiRequest("campaign-preview", {
+      const data = await apiRequest("/campaign-preview", {
         method: "POST",
         body: JSON.stringify({
           product_id: product.id,
@@ -234,8 +204,11 @@ export default function ProductsCampaigns() {
         }),
       });
 
-      setPreview(data);
-      campaignIdRef.current = createCampaignId();
+      setPreview({
+        ...data,
+        campaign_id: createCampaignId(),
+      });
+      setCampaignResult(null);
     } catch (err) {
       setError(getErrorMessage(err));
     } finally {
@@ -243,70 +216,94 @@ export default function ProductsCampaigns() {
     }
   }
 
-  async function sendCampaign() {
+  async function verifyPrice(product) {
     if (
-      sending ||
-      !preview?.send_enabled ||
-      !preview?.product?.id ||
-      Number(preview.freeform_window_count) < 1
+      !window.confirm(
+        `Have you confirmed the current selling price of ${getProductName(product)} with the store?`
+      )
     ) {
       return;
     }
 
-    const eligibleCount = Number(preview.freeform_window_count) || 0;
-    const outsideWindowCount =
-      Number(preview.approved_template_required_count) || 0;
-
-    const details = outsideWindowCount
-      ? ` ${outsideWindowCount} opted-in customer(s) outside the 24-hour window will be skipped.`
-      : "";
-
-    const confirmed = window.confirm(
-      `Send this product offer to up to ${eligibleCount} opted-in customer(s) with an open 24-hour WhatsApp window?${details} This action sends real WhatsApp messages.`
-    );
-
-    if (!confirmed) return;
-
-    setSending(true);
+    setVerifyingPriceId(product.id);
     setError("");
     setNotice("");
 
     try {
-      const campaignId = campaignIdRef.current || createCampaignId();
-      campaignIdRef.current = campaignId;
+      const expectedPrice = Number(product.price);
+      if (!Number.isFinite(expectedPrice) || expectedPrice <= 0) {
+        setError("Enter and save a valid positive selling price before verifying it.");
+        return;
+      }
 
-      const result = await apiRequest("campaign-send", {
+      await apiRequest(`/products/${encodeURIComponent(product.id)}/verify-price`, {
+        method: "POST",
+        body: JSON.stringify({ expected_price: expectedPrice }),
+      });
+      setNotice(`Price verification saved for ${getProductName(product)}.`);
+      setPreview(null);
+      await loadProducts();
+    } catch (err) {
+      setError(getErrorMessage(err));
+    } finally {
+      setVerifyingPriceId(null);
+    }
+  }
+
+  async function sendCampaign() {
+    if (
+      !preview ||
+      preview.send_enabled !== true ||
+      Number(preview.freeform_window_count || 0) < 1 ||
+      !preview.campaign_id
+    ) {
+      setError("Campaign is not eligible to send. Refresh the preview and resolve the listed blockers.");
+      return;
+    }
+
+    const recipientCount = Number(preview.freeform_window_count || 0);
+    const confirmed = window.confirm(
+      `Send this campaign to up to ${recipientCount} opted-in customer(s) with an open 24-hour WhatsApp window?`
+    );
+    if (!confirmed) return;
+
+    setSendingCampaign(true);
+    setError("");
+    setNotice("");
+    setCampaignResult(null);
+
+    try {
+      const result = await apiRequest("/campaign-send", {
         method: "POST",
         body: JSON.stringify({
           product_id: preview.product.id,
-          audience_scope: scope,
-          campaign_id: campaignId,
+          audience_scope: preview.audience_scope || scope,
+          campaign_id: preview.campaign_id,
         }),
       });
 
       setCampaignResult(result);
       setNotice(
-        `Campaign processing finished. ${Number(result.sent_count) || 0} message(s) sent.`
+        `Campaign processed: ${result.sent_count ?? 0} sent, ${result.skipped_count ?? 0} skipped, ${result.failed_count ?? 0} failed.`
       );
-
-      await Promise.all([
-        loadProducts({ quiet: true }),
-        loadResponses(),
-      ]);
+      // Require a fresh preview (and a new idempotency key) before another send.
+      setPreview(null);
     } catch (err) {
-      // Keep the campaign ID so a retry can use the same idempotency key.
       setError(getErrorMessage(err));
     } finally {
-      setSending(false);
+      setSendingCampaign(false);
     }
   }
 
-  function closePreview() {
-    if (sending) return;
-    setPreview(null);
-    setCampaignResult(null);
-    campaignIdRef.current = null;
-  }
+  const enabledCampaignCount = products.filter(
+    (product) => Boolean(product.campaign_enabled)
+  ).length;
+
+  const totalBrandInterest = products.reduce(
+    (sum, product) =>
+      sum + (Number(product.brand_interest_count) || 0),
+    0
+  );
 
   return (
     <main className="pc-page">
@@ -315,28 +312,36 @@ export default function ProductsCampaigns() {
           <p className="pc-eyebrow">MANIA MOBILES · GROWTH</p>
           <h1>Products &amp; Campaigns</h1>
           <p className="pc-subtitle">
-            Manage product details, understand demand, and preview a compliant
-            WhatsApp audience before sending a campaign.
+            Manage product details, understand demand, and preview a
+            compliant WhatsApp audience.
           </p>
         </div>
 
         <button
           className="pc-secondary"
           type="button"
-          onClick={() => loadProducts()}
+          onClick={loadProducts}
           disabled={loading}
         >
           {loading ? "Refreshing…" : "Refresh catalog"}
         </button>
       </header>
 
-      <section className="pc-summary" aria-label="Catalog summary">
-        <Stat label="Products" value={products.length} />
-        <Stat label="Campaign enabled" value={enabledCampaignCount} />
+      <section className="pc-summary">
+        <div>
+          <span>Products</span>
+          <strong>{products.length}</strong>
+        </div>
+
+        <div>
+          <span>Campaign enabled</span>
+          <strong>{enabledCampaignCount}</strong>
+        </div>
+
         <div>
           <span>Brand interest signals</span>
           <strong>{totalBrandInterest}</strong>
-          <small>Counts are per product and may overlap.</small>
+          <small>Counts are per product and can overlap.</small>
         </div>
       </section>
 
@@ -352,6 +357,17 @@ export default function ProductsCampaigns() {
         </div>
       )}
 
+      {campaignResult && (
+        <section className="pc-campaign-result" aria-live="polite">
+          <h2>Campaign result</h2>
+          <div className="pc-preview-stats">
+            <div><span>Sent</span><strong>{campaignResult.sent_count ?? 0}</strong></div>
+            <div><span>Skipped</span><strong>{campaignResult.skipped_count ?? 0}</strong></div>
+            <div><span>Failed</span><strong>{campaignResult.failed_count ?? 0}</strong></div>
+          </div>
+        </section>
+      )}
+
       <div className="pc-toolbar">
         <input
           type="search"
@@ -360,6 +376,7 @@ export default function ProductsCampaigns() {
           value={search}
           onChange={(event) => setSearch(event.target.value)}
         />
+
         <span>
           {filteredProducts.length}{" "}
           {filteredProducts.length === 1 ? "product" : "products"}
@@ -385,22 +402,26 @@ export default function ProductsCampaigns() {
                     alt={getProductName(product)}
                     loading="lazy"
                     onError={(event) => {
-                      event.currentTarget.style.visibility = "hidden";
+                      event.currentTarget.style.display = "none";
                     }}
                   />
                 ) : (
-                  <div className="pc-image-placeholder" aria-hidden="true">
-                    MM
-                  </div>
+                  <div className="pc-image-placeholder">MM</div>
                 )}
 
                 <div className="pc-product-heading">
                   <h2>{getProductName(product)}</h2>
+
                   <p>
-                    {[product.brand, product.storage, product.color]
+                    {[
+                      product.brand,
+                      product.storage,
+                      product.color,
+                    ]
                       .filter(Boolean)
                       .join(" · ")}
                   </p>
+
                   <span
                     className={`pc-stock pc-stock-${String(
                       product.stock_status || "unknown"
@@ -422,12 +443,18 @@ export default function ProductsCampaigns() {
                     step="1"
                     inputMode="numeric"
                     value={product.price ?? ""}
-                    placeholder="Enter price"
                     onChange={(event) =>
-                      editLocal(product.id, "price", event.target.value)
+                      editLocal(
+                        product.id,
+                        "price",
+                        event.target.value
+                      )
                     }
+                    placeholder="Enter price"
                   />
-                  <small>Displayed price: {formatPrice(product.price)}</small>
+                  <small>
+                    Displayed price: {formatPrice(product.price)}
+                  </small>
                 </label>
 
                 <label>
@@ -451,8 +478,11 @@ export default function ProductsCampaigns() {
               <div className="pc-interest">
                 <div>
                   <span>Brand interest</span>
-                  <strong>{Number(product.brand_interest_count) || 0}</strong>
+                  <strong>
+                    {Number(product.brand_interest_count) || 0}
+                  </strong>
                 </div>
+
                 <div>
                   <span>Product interest</span>
                   <strong>
@@ -463,9 +493,31 @@ export default function ProductsCampaigns() {
 
               <label className="pc-toggle">
                 <span>
-                  <strong>Campaign enabled</strong>
-                  <small>Enable this product for campaign planning.</small>
+                  <strong>In stock</strong>
+                  <small>Turn off when this exact item is sold out. Save changes before previewing a campaign.</small>
                 </span>
+
+                <input
+                  type="checkbox"
+                  checked={["in_stock", "in stock", "available"].includes(String(product.stock_status || "").toLowerCase())}
+                  onChange={(event) =>
+                    editLocal(
+                      product.id,
+                      "stock_status",
+                      event.target.checked ? "in_stock" : "out_of_stock"
+                    )
+                  }
+                />
+              </label>
+
+              <label className="pc-toggle">
+                <span>
+                  <strong>Campaign enabled</strong>
+                  <small>
+                    Enable this product for campaign planning.
+                  </small>
+                </span>
+
                 <input
                   type="checkbox"
                   checked={Boolean(product.campaign_enabled)}
@@ -483,9 +535,11 @@ export default function ProductsCampaigns() {
                 <button
                   type="button"
                   onClick={() => saveProduct(product)}
-                  disabled={savingId !== null || previewLoading}
+                  disabled={savingId === product.id || previewLoading}
                 >
-                  {savingId === product.id ? "Saving…" : "Save changes"}
+                  {savingId === product.id
+                    ? "Saving…"
+                    : "Save changes"}
                 </button>
 
                 <button
@@ -498,98 +552,48 @@ export default function ProductsCampaigns() {
                     !product.campaign_enabled
                   }
                 >
-                  {previewLoading ? "Preparing…" : "Preview campaign"}
+                  {previewLoading
+                    ? "Preparing…"
+                    : "Preview campaign"}
                 </button>
               </div>
 
               {product.price_verified !== true && (
-                <p className="pc-warning">
-                  Price verification is not confirmed. Verify the price with
-                  the store before promoting this product.
-                </p>
+                <>
+                  <p className="pc-warning">
+                    Price verification is not confirmed. Verify the price
+                    with the store before promoting this product.
+                  </p>
+                  <button
+                    className="pc-secondary pc-verify-price"
+                    type="button"
+                    onClick={() => verifyPrice(product)}
+                    disabled={
+                      verifyingPriceId === product.id ||
+                      savingId !== null ||
+                      previewLoading ||
+                      sendingCampaign
+                    }
+                  >
+                    {verifyingPriceId === product.id
+                      ? "Verifying…"
+                      : "I confirmed this price"}
+                  </button>
+                </>
               )}
             </article>
           ))}
         </div>
       )}
 
-      <section className="pc-responses" aria-labelledby="pc-responses-title">
-        <div className="pc-responses-header">
-          <div>
-            <p className="pc-eyebrow">CAMPAIGN ACTIVITY</p>
-            <h2 id="pc-responses-title">Customer responses</h2>
-            <p className="pc-subtitle">
-              Recent campaign replies. Phone numbers are masked in this view.
-            </p>
-          </div>
-
-          <button
-            className="pc-secondary"
-            type="button"
-            onClick={loadResponses}
-            disabled={responsesLoading}
-          >
-            {responsesLoading ? "Refreshing…" : "Refresh responses"}
-          </button>
-        </div>
-
-        {responsesError && (
-          <div className="pc-alert pc-alert-error" role="alert">
-            {responsesError}
-          </div>
-        )}
-
-        {responsesLoading ? (
-          <div className="pc-empty">Loading campaign responses…</div>
-        ) : responses.length === 0 ? (
-          <div className="pc-empty">No campaign responses recorded yet.</div>
-        ) : (
-          <div className="pc-table-wrap">
-            <table className="pc-table">
-              <thead>
-                <tr>
-                  <th>Product ID</th>
-                  <th>Customer</th>
-                  <th>Response</th>
-                  <th>Received</th>
-                </tr>
-              </thead>
-              <tbody>
-                {responses.map((item) => (
-                  <tr
-                    key={
-                      item.id ||
-                      `${item.campaign_id}-${item.phone_number}-${item.response}`
-                    }
-                  >
-                    <td>{item.product_id ?? "—"}</td>
-                    <td>{maskPhone(item.phone_number)}</td>
-                    <td>
-                      <span
-                        className={`pc-response-tag ${
-                          item.response === "interested"
-                            ? "pc-response-positive"
-                            : "pc-response-neutral"
-                        }`}
-                      >
-                        {String(item.response || "unknown").replace(/_/g, " ")}
-                      </span>
-                    </td>
-                    <td>{formatDate(item.responded_at || item.created_at)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </section>
-
       {preview && (
         <div
           className="pc-modal-backdrop"
           role="presentation"
           onMouseDown={(event) => {
-            if (event.target === event.currentTarget) closePreview();
+            if (event.target === event.currentTarget) {
+              setPreview(null);
+            }
           }}
         >
           <section
@@ -601,14 +605,14 @@ export default function ProductsCampaigns() {
             <button
               className="pc-close"
               type="button"
-              onClick={closePreview}
-              disabled={sending}
+              onClick={() => setPreview(null)}
               aria-label="Close preview"
             >
               ×
             </button>
 
             <p className="pc-eyebrow">CAMPAIGN PREVIEW</p>
+
             <h2 id="pc-preview-title">
               {preview.product?.title || "Campaign audience"}
             </h2>
@@ -617,96 +621,94 @@ export default function ProductsCampaigns() {
               Audience
               <select
                 value={scope}
-                disabled={sending}
                 onChange={(event) => {
                   setScope(event.target.value);
                   setPreview(null);
-                  setCampaignResult(null);
-                  campaignIdRef.current = null;
                 }}
               >
-                <option value="brand">People interested in this brand</option>
-                <option value="product">People interested in this product</option>
+                <option value="brand">
+                  People interested in this brand
+                </option>
+                <option value="product">
+                  People interested in this product
+                </option>
               </select>
             </label>
 
             <div className="pc-preview-stats">
-              <Stat
-                label="Matching interest"
-                value={preview.matched_interest_count}
-              />
-              <Stat
-                label="Marketing opt-in"
-                value={preview.marketing_opted_in_count}
-              />
-              <Stat
-                label="24-hour window open"
-                value={preview.freeform_window_count}
-              />
-              <Stat
-                label="Approved template required"
-                value={preview.approved_template_required_count}
-              />
+              <div>
+                <span>Matching interest</span>
+                <strong>
+                  {preview.matched_interest_count ?? 0}
+                </strong>
+              </div>
+
+              <div>
+                <span>Marketing opt-in</span>
+                <strong>
+                  {preview.marketing_opted_in_count ?? 0}
+                </strong>
+              </div>
+
+              <div>
+                <span>24-hour window open</span>
+                <strong>
+                  {preview.freeform_window_count ?? 0}
+                </strong>
+              </div>
+
+              <div>
+                <span>Approved template needed</span>
+                <strong>
+                  {preview.approved_template_required_count ?? 0}
+                </strong>
+              </div>
             </div>
 
             <div
               className={`pc-alert ${
-                preview.send_enabled ? "pc-alert-info" : "pc-alert-error"
+                preview.send_enabled === true
+                  ? "pc-alert-info"
+                  : "pc-alert-warning"
               }`}
+              role="status"
             >
               {preview.send_block_reason ||
-                (Number(preview.freeform_window_count) > 0
-                  ? "Ready to send to opted-in customers with an open 24-hour WhatsApp window. Out-of-window recipients will be skipped."
-                  : "No eligible recipients currently have an open 24-hour WhatsApp window. Configure an approved Meta marketing template before contacting out-of-window recipients.")}
+                (preview.send_enabled === true
+                  ? "Eligible recipients have explicitly opted in and have an open 24-hour WhatsApp window."
+                  : "Campaign sending is blocked until all eligibility checks pass.")}
             </div>
 
-            {campaignResult ? (
-              <div className="pc-result" role="status">
-                <h3>Campaign result</h3>
-                <div className="pc-preview-stats">
-                  <Stat label="Matched" value={campaignResult.matched_count} />
-                  <Stat label="Eligible" value={campaignResult.eligible_count} />
-                  <Stat label="Sent" value={campaignResult.sent_count} />
-                  <Stat label="Skipped" value={campaignResult.skipped_count} />
-                </div>
-
-                {Number(campaignResult.failed_count) > 0 && (
-                  <p className="pc-warning">
-                    {campaignResult.failed_count} recipient(s) failed or were
-                    skipped. Check dispatch status and server logs before
-                    retrying.
-                  </p>
-                )}
-
-                <p className="pc-footnote">
-                  Campaign ID: {campaignResult.campaign_id || "—"}
-                </p>
-              </div>
-            ) : (
-              <button
-                className="pc-send-button"
-                type="button"
-                onClick={sendCampaign}
-                disabled={
-                  sending ||
-                  !preview.send_enabled ||
-                  Number(preview.freeform_window_count) < 1
-                }
-              >
-                {sending
-                  ? "Sending campaign…"
-                  : `Send to ${
-                      Number(preview.freeform_window_count) || 0
-                    } eligible customer(s)`}
-              </button>
-            )}
+            <button
+              className={
+                preview.send_enabled === true &&
+                Number(preview.freeform_window_count || 0) > 0
+                  ? "pc-send"
+                  : "pc-send-disabled"
+              }
+              type="button"
+              onClick={sendCampaign}
+              disabled={
+                sendingCampaign ||
+                previewLoading ||
+                preview.send_enabled !== true ||
+                Number(preview.freeform_window_count || 0) < 1
+              }
+              title={
+                preview.send_enabled === true
+                  ? "Send only to opted-in customers with an open 24-hour window"
+                  : preview.send_block_reason || "Resolve the campaign blockers first"
+              }
+            >
+              {sendingCampaign
+                ? "Sending campaign…"
+                : `Send campaign — ${Number(preview.freeform_window_count || 0)} eligible customer(s)`}
+            </button>
 
             <p className="pc-footnote">
-              Sending is manual. The backend must verify the current price,
-              campaign status, explicit consent, opt-out status, and WhatsApp
-              window again at send time. Free-form messages are sent only inside
-              the 24-hour window; out-of-window recipients are skipped until an
-              approved Meta marketing template is integrated.
+              Sending is manual. Only opted-in recipients with an open
+              24-hour window are sent free-form messages. Other recipients
+              are skipped until an approved Meta marketing template is configured.
             </p>
           </section>
         </div>

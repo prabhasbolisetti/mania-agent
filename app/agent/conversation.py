@@ -123,6 +123,8 @@ EXTRA_FIELDS = {
 
     "battery_health_min",
 
+    "battery_health",
+
     "use_case",
 
     "comparison_brands",
@@ -194,6 +196,8 @@ def _get_session(customer_id: str) -> dict:
             "catalog_message_sent": False,
 
             "catalog_product": None,
+            "compact_sales_flow": False,
+            "catalog_variant_selection_required": False,
 
         }
 
@@ -232,6 +236,13 @@ def _is_brand_only(value: Any) -> bool:
 
 
 def _field_is_complete(field: str, customer: dict, session: Optional[dict] = None) -> bool:
+
+    # The production sales flow intentionally collects only the product/variant
+    # and one purchase-intent answer. Budget, timeline, condition and location
+    # are not mandatory questions; infer an interest band from the viewed item
+    # and let the owner follow up. Legacy/restored sessions keep their old rules.
+    if session and session.get("compact_sales_flow") and field != "product_interest":
+        return True
 
     value = customer.get(field)
     if field == "storage" and session and session.get("catalog_variant_unresolved"):
@@ -691,10 +702,12 @@ def _catalog_products_for_model(model: str, storage: str = "", color: str = "") 
         item_name = str(item.get("product_name") or "").strip()
         # Prefer an exact model field match. If absent, require model tokens and
         # reject Pro/Max/Plus/Ultra etc. substitutions.
-        if item_model:
-            if re.sub(r"[^a-z0-9]+", " ", item_model.lower()).strip() != re.sub(r"[^a-z0-9]+", " ", model.lower()).strip():
-                continue
-        elif not _catalog_variant_matches(model, item_name):
+        # The products table may store model with a brand prefix, storage suffix,
+        # or variant descriptor (e.g. "Apple iPhone 16 128GB"). Apply the same
+        # strict variant matcher to both model and title fields; it still rejects
+        # Pro/Max/Plus substitutions and mismatched storage.
+        candidate_model = item_model or item_name
+        if not _catalog_variant_matches(model, candidate_model):
             continue
         item_storage = _catalog_storage(item)
         item_color = _catalog_color(item)
@@ -773,48 +786,99 @@ def _catalog_model_options_message(model: str, language: str, storage: str = "")
     return title + "\n" + "\n".join(lines) + "\n\n" + note + "\n\n" + ask + "\n" + budget
 
 
+def _catalog_condition(product: dict) -> str:
+    attrs = product.get("attributes") or {}
+    return str(attrs.get("condition") or product.get("condition") or "").strip().lower()
+
+
+def _catalog_battery_health(product: dict) -> str:
+    attrs = product.get("attributes") or {}
+    value = attrs.get("battery_health") or product.get("battery_health") or ""
+    return str(value).strip()
+
+
+def _catalog_is_new(product: dict) -> bool:
+    condition = _catalog_condition(product)
+    return any(token in condition for token in ("brand new", "brand-new", "sealed", "new condition")) or condition == "new"
+
+
+def _catalog_price_sort_value(product: dict) -> float:
+    try:
+        value = float(product.get("price_inr"))
+        return value if value >= 0 else float("inf")
+    except (TypeError, ValueError, OverflowError):
+        return float("inf")
+
+
+def _remember_inferred_interest_band(customer: dict, product: dict) -> None:
+    """Record a price-interest estimate only from an explicitly verified catalog price."""
+    if product.get("price_needs_verification") is not False:
+        return
+    try:
+        price = float(product.get("price_inr"))
+    except (TypeError, ValueError, OverflowError):
+        return
+    if price <= 0:
+        return
+    customer["inferred_budget_min"] = max(0, int(price - 5000))
+    customer["inferred_budget_max"] = int(price + 5000)
+    customer["budget_source"] = "inferred_from_viewed_catalog_product_not_customer_stated"
+    customer["interest_reference_price"] = int(price)
+
+
 def _catalog_options_only_message(model: str, language: str, storage: str = "", color: str = "") -> str:
-    """Show catalog variants, with at most one URL after storage is selected."""
+    """Show exact catalog-backed options, used/second-hand cheapest first and new last."""
     telugu = language == "telugu"
     items = _catalog_products_for_model(model, storage=storage, color=color)
     if not items:
         if telugu:
-            return f"{model}కి సరిపోయే ఖచ్చితమైన వేరియంట్ ప్రస్తుత కాటలాగ్‌లో కనిపించలేదు. ధర, స్టాక్‌ను స్టోర్‌తో నిర్ధారించాలి."
-        return f"{model} ki exact matching variant current catalog lo kanipinchaledu. Price/stock store tho confirm cheyyali."
-    lines, seen, selected_link = [], set(), ""
+            return f"{model}ki saripoye exact variant catalog lo confirm kaaledu. Price, battery health, stock store tho confirm cheyyali."
+        return f"{model} ki exact matching variant catalog lo confirm kaaledu. Price, battery health, stock store tho confirm cheyyali."
+
+    # If both used and brand-new variants exist, show used options by ascending
+    # price, then brand-new options last. Unknown conditions stay between them.
+    def sort_key(item):
+        condition = _catalog_condition(item)
+        group = 2 if _catalog_is_new(item) else (0 if any(x in condition for x in ("used", "second hand", "second-hand", "refurbished", "pre-owned", "pre owned")) or re.search(r"\d{1,3}\s*%", _catalog_battery_health(item)) else 1)
+        return (group, _catalog_price_sort_value(item), str(item.get("product_name") or "").casefold())
+
+    items = sorted(items, key=sort_key)
+    lines, seen = [], set()
     for item in items:
         name = str(item.get("product_name") or model).strip()
-        url = str(item.get("product_url") or "").strip()
-        storage_label, color_label = _catalog_storage(item), _catalog_color(item)
-        details = " / ".join(part for part in (storage_label, color_label) if part)
-        label = f"{name} ({details})" if details else name
+        storage_label = _catalog_storage(item)
+        color_label = _catalog_color(item)
+        condition = _catalog_condition(item)
+        battery = _catalog_battery_health(item)
+        details = [x for x in (storage_label, color_label, condition) if x]
+        if battery and battery.lower() not in {"unknown", "n/a", "na", "none"}:
+            details.append(f"Battery health {battery}")
+        label = f"{name} ({'; '.join(details)})" if details else name
         line = f"• {label} — {_catalog_price_text(item, language)}; {_catalog_stock_text(item, language)}"
+        url = str(item.get("product_url") or "").strip()
+        if url.startswith(("https://", "http://")):
+            line += f"\n  {url}"
         if line not in seen:
             seen.add(line)
             lines.append(line)
-        if not selected_link and url.startswith(("https://", "http://")):
-            selected_link = url
         if len(lines) >= 10:
             break
-    if telugu:
-        title = f"{model} కోసం కాటలాగ్‌లో కనిపించిన వేరియంట్లు:"
-        note = "గమనిక: ఇవి కాటలాగ్ వివరాలు మాత్రమే; తాజా ధర, స్టాక్‌ను స్టోర్‌తో నిర్ధారించాలి."
-        ask = "మీకు ఏ స్టోరేజ్ కావాలి? ఏ కలర్ కావాలి?" if not storage else ""
-    else:
-        title = f"{model} ki catalog lo kanipinchina variants:"
-        note = "Note: ivi catalog details matrame; latest price/stock store tho confirm cheyyali."
-        ask = "Ye storage kavali? Ye color kavali?" if not storage else ""
-    # Never dump all product URLs into a variants message. One link maximum.
-    if storage and selected_link:
-        lines.append(f"Product link: {selected_link}")
-    suffix = ("\n\n" + ask) if ask else ""
-    return title + "\n" + "\n".join(lines) + "\n\n" + note + suffix
 
+    if telugu:
+        title = f"{model} kosam catalog lo dorikina options (used phones takkuva price nunchi; brand-new last lo):"
+        note = "Note: catalog details matrame. Latest price, battery health, stock store tho confirm cheyyali."
+        ask = "Veetilo meeku ye option kavali bro?"
+    else:
+        title = f"{model} ki catalog lo dorikina options (used phones low-to-high price; brand-new last):"
+        note = "Note: catalog details only. Latest price, battery health and stock should be confirmed with the store."
+        ask = "Veetilo meeku ye option kavali bro?"
+    return title + "\n" + "\n".join(lines) + "\n\n" + note + "\n\n" + ask
 
 def _get_product_message(
     product_interest: str,
     customer_message: str = "",
     language: str = "roman_telugu",
+    condition: str = "",
 ) -> str:
     """Return a catalog-grounded exact variant summary and URL when resolved."""
     if not product_interest:
@@ -826,11 +890,28 @@ def _get_product_message(
             item for item in matches
             if _catalog_variant_matches(product_interest, str(item.get("product_name") or item.get("model") or ""))
         ]
+        requested_battery = re.search(r"(?<!\d)(\d{1,3})\s*%", f"{customer_message} {condition}")
+        if requested_battery and re.search(r"\b(?:battery\s*health|battery\s*condition|bh)\b", f"{customer_message} {condition}", re.I):
+            battery_matches = [
+                item for item in matches
+                if re.search(
+                    rf"(?<!\d){re.escape(requested_battery.group(1))}\s*%",
+                    _catalog_battery_health(item),
+                )
+            ]
+            if not battery_matches:
+                return (
+                    f"మీరు అడిగిన {requested_battery.group(1)}% battery health variant catalog lo confirm kaaledu. Available battery-health options chupisthanu."
+                    if is_telugu else
+                    f"Meeru adigina {requested_battery.group(1)}% battery health variant catalog lo confirm kaaledu. Available battery-health options chupisthanu."
+                )
+            matches = battery_matches
         # Use exact model/storage/color catalog filtering first; it avoids a
         # similarly named color or open-box listing being selected by search rank.
         model = re.sub(r"\b\d{1,4}\s*(?:gb|tb)\b", "", product_interest, flags=re.I).strip()
-        storage_match = re.search(r"\b(64|128|256|512|1024)\s*(gb|tb)\b", product_interest, re.I)
-        color_match = re.search(r"\b(black|white|blue|pink|green|teal|ultramarine|yellow|purple|natural|titanium|silver|gold|midnight|starlight|graphite|desert|sierra|red)\b", product_interest, re.I)
+        variant_query = customer_message or product_interest
+        storage_match = re.search(r"\b(64|128|256|512|1024)\s*(gb|tb)\b", variant_query, re.I)
+        color_match = re.search(r"\b(black|white|blue|pink|green|teal|ultramarine|yellow|purple|natural|titanium|silver|gold|midnight|starlight|graphite|desert|sierra|red)\b", variant_query, re.I)
         model = re.sub(r"\b(black|white|blue|pink|green|teal|ultramarine|yellow|purple|natural|titanium|silver|gold|midnight|starlight|graphite|desert|sierra|red)\b", "", model, flags=re.I)
         model = re.sub(r"\s+", " ", model).strip()
         exact = _catalog_products_for_model(
@@ -840,6 +921,82 @@ def _get_product_message(
         )
         if exact:
             matches = exact
+
+        request_text = f"{customer_message} {condition}".lower()
+        wants_used = (
+            any(term in request_text for term in (
+                "second hand", "second-hand", "used", "refurbished", "pre-owned", "pre owned"
+            ))
+            or bool(
+                re.search(r"\b(?:battery\s*health|battery\s*condition|bh)\b", request_text)
+                and re.search(r"(?<!\d)\d{1,3}\s*%", request_text)
+            )
+        )
+        wants_new = any(term in request_text for term in (
+            "brand new", "brand-new", "sealed", "new piece", "kotha phone", "kottha phone"
+        ))
+
+        def condition_matches(item, target):
+            attrs = item.get("attributes") or {}
+            item_condition = str(attrs.get("condition") or item.get("condition") or "").lower()
+            battery_value = str(attrs.get("battery_health") or item.get("battery_health") or "").strip()
+            is_used_item = (
+                any(term in item_condition for term in (
+                    "used", "second hand", "second-hand", "refurbished", "pre-owned", "pre owned"
+                ))
+                or bool(re.search(r"(?<!\d)\d{1,3}\s*%", battery_value))
+            )
+            is_new_item = (
+                any(term in item_condition for term in ("brand new", "brand-new", "sealed"))
+                or item_condition.strip() in {"new", "new condition"}
+            )
+            return is_used_item if target == "used" else is_new_item
+
+        requested_condition = "used" if wants_used else ("new" if wants_new else "")
+        if requested_condition:
+            condition_source = exact or matches
+            condition_filtered = [
+                item for item in condition_source
+                if condition_matches(item, requested_condition)
+            ]
+            if not condition_filtered:
+                return (
+                    "మీరు అడిగిన కండిషన్‌కు సరిపోయే వేరియంట్ కాటలాగ్‌లో నిర్ధారించబడలేదు. స్టోర్‌తో ధర, బ్యాటరీ హెల్త్, స్టాక్ నిర్ధారించాలి."
+                    if is_telugu
+                    else "Ee model ki meeru adigina condition match catalog lo confirm kaaledu. Store tho price, battery health, stock confirm cheyyali."
+                )
+            matches = condition_filtered
+            exact = condition_filtered
+
+        # If the customer has not chosen storage and the model has several
+        # storage variants, show real catalog options rather than accidentally
+        # quoting the first variant's price as if it were the requested one.
+        if exact and not storage_match:
+            storage_options = []
+            seen_storage = set()
+            for item in exact:
+                storage_value = _catalog_storage(item)
+                if storage_value and storage_value not in seen_storage:
+                    seen_storage.add(storage_value)
+                    storage_options.append((storage_value, item))
+            if len(storage_options) > 1:
+                title = (
+                    f"మీరు అడిగిన మోడల్: {model}"
+                    if is_telugu
+                    else f"Mee model: {model}"
+                )
+                option_lines = []
+                for storage_value, item in storage_options[:5]:
+                    item_name = str(item.get("product_name") or item.get("model") or model).strip()
+                    option_lines.append(
+                        f"- {storage_value}: {_catalog_price_text(item, language)}; "
+                        f"{_catalog_stock_text(item, language)}"
+                    )
+                    item_url = str(item.get("product_url") or "").strip()
+                    if item_url.startswith(("https://", "http://")):
+                        option_lines[-1] += f"; {item_url}"
+                return title + "\\n" + "\\n".join(option_lines)
+
         if matches:
             product = matches[0]
             name = str(product.get("product_name") or product.get("model") or product_interest).strip()
@@ -949,16 +1106,20 @@ def _handle_saved_lead_follow_up(
 
     )
 
-    if extracted_product and _is_specific_product_mentioned(message, product_interest):
+    variant_update = bool(
+        product_interest
+        and (extracted.get("storage") or extracted.get("color"))
+    )
+    if product_interest and (
+        (extracted_product and _is_specific_product_mentioned(message, product_interest))
+        or variant_update
+    ):
 
         product_message = _get_product_message(
-
             product_interest,
-
             message,
-
             session.get("language", "roman_telugu"),
-
+            condition=str(customer.get("condition") or ""),
         )
 
     question = str(
@@ -1205,11 +1366,35 @@ def _handle_saved_lead_follow_up(
     if product_message:
         session["catalog_message_sent"] = True
         session["catalog_product"] = product_interest
-        follow_up = (
-            "మీ బడ్జెట్ ఎంత? ఏ స్టోరేజ్ వేరియంట్ కావాలి?"
-            if session.get("language") == "telugu"
-            else "Mee budget entha? Ye storage variant kavali?"
-        )
+        # Ask only one next-step question. Product/storage details already
+        # supplied by the customer must not be asked again.
+        condition = str(customer.get("condition") or "").strip().lower()
+        storage = str(customer.get("storage") or "").strip()
+        budget = customer.get("budget") or customer.get("budget_amount") or customer.get("budget_max")
+        if not storage:
+            follow_up = (
+                "ఏ స్టోరేజ్ వేరియంట్ కావాలి—128GB లేదా 256GB?"
+                if session.get("language") == "telugu"
+                else "Ye storage variant kavali bro—128GB leka 256GB?"
+            )
+        elif not condition:
+            follow_up = (
+                "మీకు కొత్త సీల్డ్ ఫోన్ కావాలా, లేక సెకండ్ హ్యాండ్ ఫోన్ కావాలా?"
+                if session.get("language") == "telugu"
+                else "Meeku brand-new sealed phone kavala, leka second-hand phone kavala?"
+            )
+        elif not budget:
+            follow_up = (
+                "మీ బడ్జెట్ ఎంత అనుకుంటున్నారు?"
+                if session.get("language") == "telugu"
+                else "Mee budget entha anukuntunnaru bro?"
+            )
+        else:
+            follow_up = (
+                "ఈ ధరకు ఫోన్ అందుబాటులో ఉంటే కొనాలనుకుంటున్నారా?"
+                if session.get("language") == "telugu"
+                else "Ee price ki phone available ga unte konadaniki interested ga unnara bro?"
+            )
         return {
             "customer_id": customer_id,
             "message": product_message + "\n\n" + follow_up,
@@ -2261,14 +2446,28 @@ def _apply_deterministic_customer_updates(message: str, extracted: dict, custome
             result["color"] = canonical
             break
 
-    # Condition / new-vs-used.
-
-    if re.search(r"\b(brand new|brand-new|new piece|sealed piece|sealed|kotha phone|kottha phone|new phone)\b", text):
-
+    # Condition / new-vs-used. A stated battery-health percentage is a strong
+    # second-hand-device signal in this shop's catalog flow, unless the customer
+    # explicitly says they want a brand-new device in the same message.
+    explicit_new = bool(re.search(
+        r"\b(brand new|brand-new|new piece|sealed piece|sealed|kotha phone|kottha phone|new phone)\b",
+        text,
+    ))
+    explicit_used = bool(re.search(
+        r"\b(used|second hand|second-hand|refurbished|renewed|pre owned|pre-owned)\b",
+        text,
+    ))
+    mentions_battery_health = bool(
+        re.search(r"\b(?:battery\s*health|battery\s*condition|bh)\b", text, re.I)
+        and re.search(r"(?<!\d)\d{1,3}\s*%", text)
+    )
+    if mentions_battery_health:
+        battery_match = re.search(r"(?<!\d)(\d{1,3})\s*%", text)
+        if battery_match:
+            result["battery_health"] = f"{battery_match.group(1)}%"
+    if explicit_new:
         result["condition"] = "brand new"
-
-    elif re.search(r"\b(used|second hand|second-hand|refurbished|renewed|pre owned|pre-owned)\b", text):
-
+    elif explicit_used or mentions_battery_health:
         result["condition"] = "used/refurbished"
 
     # Payment preferences, including multiple acceptable methods.
@@ -3054,19 +3253,11 @@ def _process_message_impl(
     # Color is optional. Once storage is known, do not keep the customer stuck
     # asking for a color; present the matching storage options and at most one link.
     color_resolved = bool(current_color) or bool(current_storage) or len(colors_for_storage) <= 1
-    # A model-only message is a discovery turn, not permission to dump the
-    # catalog. Ask for storage, optional color, and budget first. Do not return
-    # product names/prices/URLs until the customer has supplied preferences.
-    model_only_needs_preferences = bool(
-        _is_specific_model_name(current_product)
-        and product_named_now
-        and not current_storage
-        and not current_color
-    )
-    if model_only_needs_preferences:
-        product_message = ""
-        session["catalog_product"] = None
-        session["catalog_message_sent"] = False
+    # Compact sales flow: show the catalog immediately for a named model.
+    # Do not require a budget, timeline, city, color or condition questionnaire.
+    if _is_specific_model_name(current_product) and (product_named_now or variant_supplied_now):
+        session["compact_sales_flow"] = True
+    model_only_needs_preferences = False
     if _is_specific_model_name(current_product) and (product_named_now or variant_supplied_now or session.get("catalog_variant_unresolved")) and not model_only_needs_preferences:
         if variant_is_complete and color_resolved:
             # A direct product URL is returned only for a unique exact model,
@@ -3074,8 +3265,35 @@ def _process_message_impl(
             exact_matches = _catalog_products_for_model(
                 current_product, storage=current_storage, color=current_color
             )
+            requested_battery = re.search(r"(?<!\d)(\d{1,3})\s*%", message)
+            if requested_battery:
+                exact_matches = [
+                    item for item in exact_matches
+                    if re.search(
+                        rf"(?<!\d){re.escape(requested_battery.group(1))}\s*%",
+                        _catalog_battery_health(item),
+                    )
+                ]
+            requested_condition = str(customer.get("condition") or "").lower()
+            if requested_condition:
+                wants_used_condition = any(term in requested_condition for term in ("used", "second hand", "refurbished", "pre-owned"))
+                wants_new_condition = any(term in requested_condition for term in ("brand new", "sealed", "new condition"))
+                if wants_used_condition:
+                    filtered = [item for item in exact_matches if not _catalog_is_new(item)]
+                    if filtered:
+                        exact_matches = filtered
+                elif wants_new_condition:
+                    filtered = [item for item in exact_matches if _catalog_is_new(item)]
+                    if filtered:
+                        exact_matches = filtered
             if len(exact_matches) == 1:
-                product_message = _get_product_message(variant_key, variant_key, active_language)
+                _remember_inferred_interest_band(customer, exact_matches[0])
+                product_message = _get_product_message(
+                    variant_key,
+                    f"{message} battery health {customer.get('battery_health', '')}",
+                    active_language,
+                    condition=str(customer.get("condition") or ""),
+                )
                 session["catalog_product"] = variant_key if product_message else None
                 session.pop("catalog_variant_unresolved", None)
             elif len(exact_matches) > 1 and current_storage and not current_color:
@@ -3110,6 +3328,108 @@ def _process_message_impl(
                 session.pop("catalog_variant_unresolved", None)
         session["catalog_message_sent"] = bool(product_message)
 
+    # Compact sales flow: return catalog options first if the customer's
+    # model/condition/storage/battery description still maps to several rows.
+    if session.get("compact_sales_flow") and _is_specific_model_name(current_product):
+        try:
+            model_variants = _catalog_products_for_model(current_product)
+            selected_variants = _catalog_products_for_model(
+                current_product, storage=current_storage, color=current_color
+            ) if current_storage or current_color else list(model_variants)
+            requested_battery = re.search(r"(?<!\d)(\d{1,3})\s*%", message)
+            if not requested_battery:
+                requested_battery = re.search(
+                    r"(?<!\d)(\d{1,3})\s*%", str(customer.get("battery_health") or "")
+                )
+            if requested_battery:
+                selected_variants = [
+                    item for item in selected_variants
+                    if re.search(
+                        rf"(?<!\d){re.escape(requested_battery.group(1))}\s*%",
+                        _catalog_battery_health(item),
+                    )
+                ]
+            requested_condition = str(customer.get("condition") or "").lower()
+            if requested_condition:
+                if any(term in requested_condition for term in ("used", "second hand", "refurbished", "pre-owned")):
+                    conditioned = [item for item in selected_variants if not _catalog_is_new(item)]
+                    if conditioned:
+                        selected_variants = conditioned
+                elif any(term in requested_condition for term in ("brand new", "sealed", "new condition")):
+                    conditioned = [item for item in selected_variants if _catalog_is_new(item)]
+                    if conditioned:
+                        selected_variants = conditioned
+
+            # If the requested battery health is absent, never substitute another
+            # battery level's price. Show real alternatives and ask one choice.
+            if requested_battery and not selected_variants:
+                session["catalog_variant_selection_required"] = True
+                session["asked_field"] = "storage"
+                product_message = _catalog_options_only_message(
+                    current_product, active_language, storage=current_storage, color=current_color
+                )
+                prefix = (
+                    f"{requested_battery.group(1)}% battery health exact match catalog lo confirm kaaledu. Available options ive:\n\n"
+                    if active_language != "telugu" else
+                    f"{requested_battery.group(1)}% battery health ఖచ్చితమైన match catalog lo confirm kaaledu. Available options ఇవి:\n\n"
+                )
+                session["_return_template_reply"] = True
+                return {
+                    "customer_id": customer_id, "message": prefix + product_message,
+                    "customer": customer, "qualification": session.get("qualification"),
+                    "intent": session.get("intent"), "intent_history": session.get("intent_history", []),
+                    "lead_id": session.get("lead_id"), "lead_saved": bool(session.get("lead_saved")),
+                }
+
+            needs_choice = (
+                len(selected_variants) > 1
+                or (not current_storage and not current_color and not requested_battery and len(model_variants) > 1)
+            )
+            if needs_choice:
+                session["catalog_variant_selection_required"] = True
+                session["asked_field"] = "storage"
+                product_message = _catalog_options_only_message(
+                    current_product, active_language, storage=current_storage, color=current_color
+                )
+                session["_return_template_reply"] = True
+                return {
+                    "customer_id": customer_id, "message": product_message,
+                    "customer": customer, "qualification": session.get("qualification"),
+                    "intent": session.get("intent"), "intent_history": session.get("intent_history", []),
+                    "lead_id": session.get("lead_id"), "lead_saved": bool(session.get("lead_saved")),
+                }
+
+            if len(selected_variants) == 1:
+                selected_item = selected_variants[0]
+                _remember_inferred_interest_band(customer, selected_item)
+                selected_storage = _catalog_storage(selected_item)
+                selected_color = _catalog_color(selected_item)
+                query = " ".join(x for x in (current_product, selected_storage, selected_color) if x)
+                product_message = _get_product_message(
+                    query,
+                    f"{message} battery health {customer.get('battery_health', '')}",
+                    active_language,
+                    condition=str(customer.get("condition") or ""),
+                )
+                session["catalog_product"] = query
+                session.pop("catalog_variant_selection_required", None)
+            elif not model_variants:
+                # Don't ask purchase intent when we couldn't find the requested model.
+                session["_return_template_reply"] = True
+                no_match = product_message or (
+                    f"{current_product} catalog lo confirm kaaledu. Similar available models chupinchana?"
+                    if active_language != "telugu" else
+                    f"{current_product} catalog lo confirm kaaledu. Similar available models chupinchana?"
+                )
+                return {
+                    "customer_id": customer_id, "message": no_match,
+                    "customer": customer, "qualification": session.get("qualification"),
+                    "intent": session.get("intent"), "intent_history": session.get("intent_history", []),
+                    "lead_id": session.get("lead_id"), "lead_saved": bool(session.get("lead_saved")),
+                }
+        except Exception as exc:
+            print("Compact sales variant selection failed:", type(exc).__name__)
+
     all_qualification_fields_complete = all(
         _field_is_complete(field, customer, session) for field in FIELD_ORDER
     )
@@ -3117,6 +3437,46 @@ def _process_message_impl(
         session.get("intent_question_asked") and all_qualification_fields_complete
     )
     nonbuyer_mode = _nonbuyer_mode(message)
+
+    # If the customer is responding in a way that deterministic extraction did
+    # not understand, let the configured LLM interpret the intent once. Keep the
+    # safe deterministic draft as fallback when no provider is configured/fails.
+    recognized_business_reply = bool(
+        extracted or intent_followup or price_objection or repair_message
+        or product_message or _store_faq_reply(message, active_language)
+        or _is_greeting_message(message)
+    )
+    if (
+        session.get("compact_sales_flow")
+        and _has_business_context(session)
+        and not recognized_business_reply
+        and not answering_intent_question
+    ):
+        fallback_draft = (
+            "Mee message ni exact ga artham chesukolekapoyanu bro. Phone price, condition, availability leda purchase interest gurinchi chepthunnara?"
+            if active_language != "telugu" else
+            "మీ మెసేజ్‌ను పూర్తిగా అర్థం చేసుకోలేకపోయాను బ్రో. ఫోన్ ధర, కండిషన్, అందుబాటు లేదా కొనుగోలు ఆసక్తి గురించి చెబుతున్నారా?"
+        )
+        try:
+            llm_reply = generate_response(
+                draft_response=fallback_draft,
+                customer_message=message,
+                language=active_language,
+                customer=customer,
+                conversation_history=session.get("conversation_history", [])[-8:],
+                catalog_context=[],
+                force_llm=True,
+            )
+            if llm_reply and llm_reply.strip() != fallback_draft.strip():
+                session["_return_template_reply"] = True
+                return {
+                    "customer_id": customer_id, "message": llm_reply,
+                    "customer": customer, "qualification": session.get("qualification"),
+                    "intent": session.get("intent"), "intent_history": session.get("intent_history", []),
+                    "lead_id": session.get("lead_id"), "lead_saved": bool(session.get("lead_saved")),
+                }
+        except Exception as exc:
+            print("Ambiguous-intent LLM response failed:", type(exc).__name__)
 
     if nonbuyer_mode == "decline" and not answering_intent_question:
 
@@ -3332,10 +3692,12 @@ def _process_message_impl(
         # Ask one consistent final intent question only. Do not ask a second
         # timeline-vs-comparison clarification after the customer answers it.
         if active_language == "telugu":
-            draft_reply = "ఈ ప్రోడక్ట్ ధర, స్టాక్ మీకు సరిపోతే కొనాలనుకుంటున్నారా? మీ కోసం రిజర్వ్ చేయడానికి మా టీమ్‌ను సంప్రదించమంటారా? మీ సమాధానం ఆధారంగా మీ ఆసక్తిని నమోదు చేస్తాను."
+            draft_reply = "ఈ ధర, స్టాక్ మీకు సరిపోతే ఈరోజే కొనడానికి ఆసక్తి ఉందా బ్రో? మీ సమాధానాన్ని మా టీమ్‌కు తెలియజేసి, వారు మిమ్మల్ని సంప్రదించడానికి సహాయం చేస్తాను."
         else:
-            draft_reply = "Ee product price, stock meeku set aithe konalanukuntunnara? Mee kosam reserve cheyadaniki maa team mimmalni contact avvalani cheppamantara? Mee answer batti mee interest note chestha."
+            draft_reply = "Ee price, stock meeku set aithe eeroje konadaniki interested ga unnara bro? Mee interest maa team ki share chesi, vallu mimmalni contact avvadaniki help chestha."
 
+        if product_message:
+            draft_reply = product_message.strip() + "\n\n" + draft_reply
         session["_return_template_reply"] = True
         return {
             "customer_id": customer_id,
@@ -3520,37 +3882,25 @@ def _process_message_impl(
     if final_intent_kind in {"compare", "price_concern", "decline"}:
         if session.get("language") == "telugu":
             first_final_message = (
-                "పర్లేదు 😊 మీరు ఇప్పుడే కొనాలని నిర్ణయించుకోలేదని నమోదు చేశాము. ఒత్తిడి చేయము; తర్వాత ధరలు లేదా మోడళ్లు పోల్చి చూడాలనిపిస్తే చెప్పండి."
+                "ధన్యవాదాలు బ్రో 😊 ఇప్పుడే కొనాలని నిర్ణయించుకోలేదని నమోదు చేశాము. ఎలాంటి ఒత్తిడి లేదు. ఇంకా ఏ మొబైల్ గురించి తెలుసుకోవాలన్నా మెసేజ్ చేయండి."
                 if final_intent_kind == "decline" else
-                _saved_purchase_acknowledgement(message, customer, session.get("language", "roman_telugu"))
+                _saved_purchase_acknowledgement(message, customer, session.get("language", "roman_telugu")) + "\n\nఇంకా ఏ మొబైల్ గురించి తెలుసుకోవాలన్నా మెసేజ్ చేయండి 😊"
             )
-            final_messages = [
-                first_final_message,
-                "ముఖ్యమైన విషయం: మీ కార్డ్ నంబర్, CVV, PIN లేదా OTP ను ఈ చాట్‌లో పంచుకోవద్దు.",
-                "ఇంకా ఏ మొబైల్ గురించి తెలుసుకోవాలన్నా Mania Mobiles‌కు మెసేజ్ చేయండి లేదా స్టోర్‌ను సంప్రదించండి. ధన్యవాదాలు 😊",
-            ]
+            final_messages = [first_final_message]
         else:
             first_final_message = (
-                "Parledhu 😊 Ippudu konalani decide avvaledani note chesam. Pressure cheyyamu; tarvatha models/prices compare cheyyali anipisthe cheppandi."
+                "Dhanyavaadalu bro 😊 Ippudu konalani decide avvaledani note chesam. Pressure emi ledu. Inka ye mobile gurinchi telusukovalanna message cheyyandi."
                 if final_intent_kind == "decline" else
-                _saved_purchase_acknowledgement(message, customer, session.get("language", "roman_telugu"))
+                _saved_purchase_acknowledgement(message, customer, session.get("language", "roman_telugu")) + "\n\nInka ye mobile gurinchi telusukovalanna message cheyyandi 😊"
             )
-            final_messages = [
-                first_final_message,
-                "Mukhyam: Mee card number, CVV, PIN leka OTP ni ee chat lo share cheyyakandi.",
-                "Inka ye mobile gurinchi telusukovalanna Mania Mobiles ki message cheyyandi leda store ni contact cheyyandi. Dhanyavaadalu 😊",
-            ]
+            final_messages = [first_final_message]
     elif final_intent_kind == "positive" and session.get("language") == "telugu":
         final_messages = [
-            "ధన్యవాదాలు 😊 మీ కొనుగోలు ఆసక్తి, ప్రోడక్ట్ వివరాలను నమోదు చేశాము. స్టాక్, ధర, రిజర్వేషన్‌ను నిర్ధారించడానికి Mania Mobiles టీమ్ మిమ్మల్ని సంప్రదించవచ్చు.",
-            "ముఖ్యమైన విషయం: మీ కార్డ్ నంబర్, CVV, PIN లేదా OTP ను ఈ చాట్‌లో పంచుకోవద్దు.",
-            "ఇంకా ఏ మొబైల్ గురించి తెలుసుకోవాలన్నా Mania Mobiles‌కు మెసేజ్ చేయండి లేదా స్టోర్‌ను సంప్రదించండి. ధన్యవాదాలు 😊",
+            "ధన్యవాదాలు బ్రో 😊 మీ కొనుగోలు ఆసక్తిని నమోదు చేశాము. ధర, స్టాక్ నిర్ధారించడానికి మా టీమ్ మిమ్మల్ని సంప్రదించవచ్చు. ఇంకా ఏ మొబైల్ గురించి తెలుసుకోవాలన్నా మెసేజ్ చేయండి."
         ]
     elif final_intent_kind == "positive":
         final_messages = [
-            "Dhanyavaadalu 😊 Mee purchase interest, product details note chesam. Stock, price, reservation confirm cheyadaniki Mania Mobiles team mimmalni contact avvachu.",
-            "Mukhyam: Mee card number, CVV, PIN leka OTP ni ee chat lo share cheyyakandi.",
-            "Inka ye mobile gurinchi telusukovalanna Mania Mobiles ki message cheyyandi leda store ni contact cheyyandi. Dhanyavaadalu 😊",
+            "Dhanyavaadalu bro 😊 Mee purchase interest note chesam. Price, stock confirm cheyadaniki maa team mimmalni contact avvachu. Inka ye mobile gurinchi telusukovalanna message cheyyandi."
         ]
     elif session.get("language") == "telugu":
 
@@ -3858,6 +4208,8 @@ def _begin_new_cycle_after_completed_lead(session: dict, customer_id: str) -> No
         "intent_question_asked": False,
         "catalog_message_sent": False,
         "catalog_product": None,
+        "compact_sales_flow": False,
+        "catalog_variant_selection_required": False,
         "_restored_completed_session": False,
     })
 
@@ -4311,13 +4663,13 @@ def _process_message_serialized(customer_id: str, message: str) -> dict:
             )
         elif language == "telugu":
             greeting_reply = (
-                "హాయ్! Mania Mobiles కి స్వాగతం 😊 మొబైల్ మోడళ్లు, ధరలు, కలర్లు, స్టోరేజ్ ఆప్షన్లలో సహాయం చేస్తాను. మీకు ఏ మొబైల్ గురించి తెలుసుకోవాలి? ఏ బ్రాండ్/మోడల్ అయినా చెప్పండి."
+                "హాయ్! Mania Mobiles కి స్వాగతం 😊 మొబైల్ మోడళ్లు, ధరలు, కలర్లు, స్టోరేజ్ ఆప్షన్లలో సహాయం చేస్తాను. మీకు ఏ మొబైల్ గురించి తెలుసుకోవాలి? ఏ బ్రాండ్/మోడల్ అయినా చెప్పండి.\nWhatsApp లో ఆఫర్లు కావాలంటే START అని సందేశం పంపండి. ఆపడానికి ఎప్పుడైనా STOP అని సందేశం పంపవచ్చు."
                 if previous_history_len == 0
                 else "హాయ్ 😊 Mania Mobiles మొబైల్ వివరాల్లో సహాయం చేస్తాను. మీరు చూస్తున్న బ్రాండ్/మోడల్ పేరు చెప్పండి."
             )
         else:
             greeting_reply = (
-                "Hi! Mania Mobiles ki welcome 😊 Mobile models, prices, colors, storage options lo help chestha. Meeku ye mobile gurinchi telusukovali? Ye brand/model aina cheppandi."
+                "Hi! Mania Mobiles ki welcome 😊 Mobile models, prices, colors, storage options lo help chestha. Meeku ye mobile gurinchi telusukovali? Ye brand/model aina cheppandi.\nOccasional promotional WhatsApp offers kavali ante START ani reply ivvandi. Aapadaniki eppudaina STOP ani reply ivvachu."
                 if previous_history_len == 0
                 else "Hi 😊 Mania Mobiles mobile details lo help chestha. Ye brand/model chusthunnaru?"
             )
