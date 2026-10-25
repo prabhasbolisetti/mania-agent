@@ -1,3 +1,5 @@
+import os
+
 import re
 
 from datetime import datetime, timedelta, timezone
@@ -15,6 +17,12 @@ from app.agent.llm import (
     detect_language,
 
     generate_response,
+
+    answer_unhandled_message,
+
+    extract_deterministic_details,
+
+    has_concrete_signal,
 
 )
 
@@ -2694,13 +2702,25 @@ def _parse_explicit_budget_amount(message: str, asked_field: str = ""):
 MANIA_STORE_ADDRESS = "Beside MGB Mall, Nellore, Andhra Pradesh"
 MANIA_STORE_MAPS_URL = "https://www.google.com/maps/search/?api=1&query=Beside+MGB+Mall%2C+Nellore%2C+Andhra+Pradesh"
 
+# Upper bound on model calls for unclassified messages in one session (cost/abuse cap).
+try:
+    FRICTION_LLM_MAX_PER_SESSION = max(0, int(os.getenv("LLM_FRICTION_MAX_PER_SESSION", "8")))
+except ValueError:
+    FRICTION_LLM_MAX_PER_SESSION = 8
+
 
 def _store_faq_reply(message: str, language: str) -> Optional[str]:
     """Grounded answers for store policies that are explicitly provided by the business."""
     text = (message or "").casefold()
     asks_emi = any(x in text for x in ("emi", "installment", "instalment", "ఈఎంఐ", "వాయిదా"))
     asks_exchange = any(x in text for x in ("exchange", "trade in", "trade-in", "పాత ఫోన్", "ఎక్స్చేంజ్"))
-    if not asks_emi and not asks_exchange:
+    asks_location = any(x in text for x in (
+        "ekkada untaru", "ekkada vuntaru", "ekkada undi", "ekkada undhi", "store ekkada",
+        "shop ekkada", "store address", "shop address", "where is the store",
+        "where is your store", "where are you located", "మీరు ఎక్కడ", "షాప్ ఎక్కడ",
+        "స్టోర్ ఎక్కడ", "అడ్రస్",
+    ))
+    if not asks_emi and not asks_exchange and not asks_location:
         return None
     if language == "telugu":
         parts = []
@@ -4467,12 +4487,9 @@ def _is_valid_answer_for_current_field(message: str, session: dict) -> bool:
     return False
 
 
-def _is_business_related_message(message: str, session: dict) -> bool:
-    """Conservative local scope gate: no model call for obvious unrelated input."""
+def _is_explicit_off_topic(message: str) -> bool:
+    """Obvious unrelated requests. These never reach the LLM (no cost, no drift)."""
     text = (message or "").strip().lower()
-
-    # Explicit off-topic intent takes precedence over field heuristics. For example,
-    # "write a poem" must not be mistaken for a town name when location is pending.
     off_topic_terms = (
         "tell me a joke", "make me laugh", "write a poem", "solve my homework",
         "do my assignment", "weather forecast", "news about politics", "political news",
@@ -4481,12 +4498,40 @@ def _is_business_related_message(message: str, session: dict) -> bool:
         "debug my code", "write python code", "what is the capital",
     )
     if any(term in text for term in off_topic_terms):
+        return True
+    return bool(re.fullmatch(
+        r"(how are you|what are you doing|tell me something|who are you|what is your name)[?.! ]*",
+        text,
+    ))
+
+
+def _has_extractable_business_detail(message: str, session: dict) -> bool:
+    """True when the rule-based extractors find a real detail in a follow-up.
+
+    Short follow-ups such as "45k varaku", "weekend lo bro", "Bhimavaram nunchi
+    vastha" or "Ha" carry budget/timeline/location/confirmation data. They must
+    reach the normal flow so the detail is stored, instead of being rejected as
+    off-topic. Only applies once the conversation has business context.
+    """
+    if not _has_business_context(session):
         return False
-    if re.fullmatch(r"(how are you|what are you doing|tell me something|who are you|what is your name)[?.! ]*", text):
+    language = session.get("language") or "roman_telugu"
+    return has_concrete_signal(extract_deterministic_details(message, language))
+
+
+def _is_business_related_message(message: str, session: dict) -> bool:
+    """Conservative local scope gate: no model call for obvious unrelated input."""
+    text = (message or "").strip().lower()
+
+    # Explicit off-topic intent takes precedence over field heuristics. For example,
+    # "write a poem" must not be mistaken for a town name when location is pending.
+    if _is_explicit_off_topic(message):
         return False
     if _is_ai_identity_question(message):
         return True
     if _is_valid_answer_for_current_field(message, session):
+        return True
+    if _has_extractable_business_detail(message, session):
         return True
     if _has_business_context(session) and _is_context_repair_message(message):
         return True
@@ -4514,6 +4559,122 @@ def _out_of_scope_reply(language: str) -> str:
     if language == "roman_telugu":
         return "Sorry 😊 Nenu Mania Mobiles ki sambandhinchina mobile models, prices, colors, storage, stock, EMI, exchange mariyu purchase details lo maatrame help cheyyagalanu."
     return "Sorry 😊 I can only help with Mania Mobiles mobile models, prices, colors, storage, stock, EMI, exchange, and purchase details."
+
+
+def _friction_catalog_context(customer: dict) -> list:
+    """Verified catalogue facts about the customer's current product, if any."""
+    interest = str(customer.get("model") or customer.get("product_interest") or "").strip()
+    if not interest:
+        return []
+    try:
+        products = _search_catalog(interest)
+    except Exception as exc:
+        print("Friction catalog lookup failed:", type(exc).__name__)
+        return []
+    context = []
+    for product in products[:5]:
+        entry = {
+            "product_name": product.get("product_name"),
+            "storage": _catalog_storage(product) or None,
+            "color": _catalog_color(product) or None,
+            "condition": _catalog_condition(product) or None,
+            "battery_health": _catalog_battery_health(product) or None,
+            "stock_status": product.get("stock_status"),
+            "product_url": product.get("product_url"),
+        }
+        # Never hand the model a price that the catalogue marks as unverified.
+        if not product.get("price_needs_verification") and product.get("price_inr") is not None:
+            entry["price_inr"] = product.get("price_inr")
+        context.append({key: value for key, value in entry.items() if value not in (None, "")})
+    return context
+
+
+def _unhandled_clarification(language: str, customer: dict) -> str:
+    """Safe template when the LLM is off or rejected: acknowledge, don't deflect."""
+    product = str(customer.get("model") or customer.get("product_interest") or "").strip()
+    if language == "telugu":
+        if product:
+            return f"సరే 😊 {product} గురించి ధర, స్టోరేజ్, కలర్ లేదా అందుబాటు — ఏది తెలుసుకోవాలి? చెప్పండి, సహాయం చేస్తాను."
+        return "సరే 😊 మీకు ఏ మొబైల్ గురించి తెలుసుకోవాలి? బ్రాండ్/మోడల్ చెప్పండి."
+    if product:
+        return f"Sare bro 😊 {product} gurinchi price, storage, color leka availability — edi telusukovali? Cheppandi, help chestha."
+    return "Sare bro 😊 Ye mobile gurinchi telusukovali? Brand/model cheppandi, help chestha."
+
+
+def _llm_unhandled_reply(message: str, session: dict, language: str) -> Optional[str]:
+    """Grounded, validated LLM answer for an unclassified message, or None.
+
+    Bounded per session (LLM_FRICTION_MAX_PER_SESSION) so a chatty or abusive
+    customer cannot run up model cost. Returns None when the model is disabled,
+    fails, or its reply is rejected by the validator.
+    """
+    customer = session.get("customer") or {}
+    used = int(session.get("friction_llm_calls") or 0)
+    if used >= FRICTION_LLM_MAX_PER_SESSION:
+        return None
+    session["friction_llm_calls"] = used + 1
+    return answer_unhandled_message(
+        customer_message=message,
+        language=language,
+        customer=customer,
+        conversation_history=(session.get("conversation_history") or [])[-8:],
+        catalog_context=_friction_catalog_context(customer),
+        store_facts={"store_address": MANIA_STORE_ADDRESS, "google_maps": MANIA_STORE_MAPS_URL},
+    )
+
+
+def _unhandled_message_reply(message: str, session: dict, language: str) -> str:
+    """Reply to a message the rules did not understand (customer friction).
+
+    Order: grounded LLM answer -> deterministic clarification. Explicit
+    off-topic requests never get here.
+    """
+    reply = _llm_unhandled_reply(message, session, language)
+    if reply:
+        return reply
+    return _unhandled_clarification(language, session.get("customer") or {})
+
+
+def _normalize_reply_text(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "")).strip().casefold()
+
+
+def _last_turn_text(history: list, sender: str) -> str:
+    for item in reversed(history or []):
+        if isinstance(item, dict) and item.get("sender_type") == sender:
+            return _normalize_reply_text(item.get("message"))
+    return ""
+
+
+def _is_repeated_reply(reply: str, session: dict, message: str) -> bool:
+    """True when the flow is about to send the same reply as last turn.
+
+    A repeated reply to a *new* customer message means the rules did not
+    understand it (e.g. "Battery health ante enti?" answered with the same
+    product list again). A customer re-sending the same text (WhatsApp retry or
+    impatience) is not friction, so identical customer messages are excluded.
+    """
+    history = session.get("conversation_history") or []
+    current = _normalize_reply_text(reply)
+    if not current or len(current) < 20:
+        return False
+    previous_assistant = _last_turn_text(history, "assistant")
+    if not previous_assistant or current != previous_assistant:
+        return False
+    # The current turn may or may not be recorded yet; drop it, then compare
+    # with the customer's previous message.
+    wanted = _normalize_reply_text(message)
+    customer_turns = [
+        _normalize_reply_text(item.get("message"))
+        for item in history
+        # Customer turns are stored without sender_type; storage defaults them to "customer".
+        if isinstance(item, dict) and item.get("sender_type", "customer") != "assistant"
+    ]
+    if customer_turns and customer_turns[-1] == wanted:
+        customer_turns = customer_turns[:-1]
+    if customer_turns and customer_turns[-1] == wanted:
+        return False
+    return True
 
 
 def _process_message_serialized(customer_id: str, message: str) -> dict:
@@ -4689,9 +4850,13 @@ def _process_message_serialized(customer_id: str, message: str) -> dict:
         # (for example "82000", "128GB", or "Bhimavaram") are allowed by field state.
         if not _is_business_related_message(message, session):
             language = _resolve_response_language(message, session)
+            if _is_explicit_off_topic(message):
+                scope_reply = _out_of_scope_reply(language)
+            else:
+                scope_reply = _unhandled_message_reply(message, session, language)
             result = {
                 "customer_id": customer_id,
-                "message": _out_of_scope_reply(language),
+                "message": scope_reply,
                 "customer": session.get("customer", {}),
                 "qualification": session.get("qualification"),
                 "intent": session.get("intent"),
@@ -4701,6 +4866,15 @@ def _process_message_serialized(customer_id: str, message: str) -> dict:
             }
         else:
             result = _process_message_impl(customer_id, message)
+            # Repeating the previous reply to a new message = the rules did not
+            # understand it. Let the grounded LLM answer the real question; keep
+            # the rule-based reply if the model is off, fails, or is rejected.
+            live_session = _get_session(customer_id)
+            if _is_repeated_reply(result.get("message"), live_session, message):
+                friction_language = _resolve_response_language(message, live_session)
+                friction_reply = _llm_unhandled_reply(message, live_session, friction_language)
+                if friction_reply:
+                    result["message"] = friction_reply
 
     session = _get_session(customer_id)
 

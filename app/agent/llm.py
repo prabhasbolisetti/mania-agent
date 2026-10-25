@@ -22,6 +22,7 @@ from app.agent.prompts import (
     EXTRACTION_SYSTEM_PROMPT,
     build_customer_response_prompt,
     build_extraction_prompt,
+    build_unhandled_message_prompt,
 )
 
 MODEL_NAME = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
@@ -3570,3 +3571,189 @@ def generate_response(
         language=language,
         customer=customer,
     )
+
+
+# ---------------------------------------------------------
+# GROUNDED LLM FALLBACK FOR MESSAGES THE RULES DID NOT UNDERSTAND
+# ---------------------------------------------------------
+# The deterministic flow stays first for everything it can classify. This layer
+# only runs for customer friction: short follow-ups, side questions and
+# fragments that no rule matched. The model may only use catalogue / store facts
+# supplied by the application, and every reply is validated before it is sent.
+# On any doubt (provider off, timeout, wrong language, invented number or URL,
+# fake action claim) it returns None and the caller uses a safe template.
+
+_CONCRETE_SIGNAL_KEYS = (
+    "budget", "budget_amount", "budget_min", "budget_max", "storage", "color",
+    "colour", "battery_health", "condition", "payment_method",
+    "purchase_timeline", "location", "product_interest", "product_question",
+    "_confirmed", "_negative",
+)
+
+_ROMAN_REPLY_MARKERS = re.compile(
+    r"\b(meeku|mee|meeru|nenu|kavali|kavala|undi|undhi|unnayi|ledu|cheppandi|"
+    r"cheppu|chesi|chestha|chesthanu|parledhu|sare|konali|entha|ela|inka|kosam|"
+    r"avunu|avuthundi|avutundi|chudandi|telusukovali|ekkada|ante)\b",
+    re.I,
+)
+_FAKE_ACTION_CLAIM = re.compile(
+    r"\b(reserved|booked|order placed|payment received|team (ki )?(inform|notify)|"
+    r"notified|reserve (chesam|cheshamu|chesaanu)|book (chesam|cheshamu|chesaanu)|"
+    r"order (chesam|cheshamu)|confirm (chesam|cheshamu))\b|రిజర్వ్ చేశాం|బుక్ చేశాం",
+    re.I,
+)
+_INTERNAL_LEAK = re.compile(r"\b(lead score|intent score|qualification|scoring|system prompt)\b", re.I)
+_URL_RE = re.compile(r"https?://[^\s)>\]\"'{}]+", re.I)
+_NUMBER_RE = re.compile(r"\d[\d,]*")
+_K_NUMBER_RE = re.compile(r"(\d+(?:\.\d+)?)\s*k\b", re.I)
+
+FRICTION_MAX_REPLY_CHARS = 900
+
+
+def extract_deterministic_details(message: str, language: str) -> dict:
+    """Run only the rule-based extractors (never the LLM). Safe on any input."""
+    try:
+        result = _extract_deterministically(message or "", language)
+    except Exception as exc:
+        print("Deterministic extraction failed:", type(exc).__name__)
+        return {}
+    return result if isinstance(result, dict) else {}
+
+
+def has_concrete_signal(extracted: Optional[dict]) -> bool:
+    """True when extraction found a real customer detail (budget, storage, ...)."""
+    if not isinstance(extracted, dict):
+        return False
+    return any(extracted.get(key) for key in _CONCRETE_SIGNAL_KEYS)
+
+
+def _numbers_in(text: str) -> set:
+    found = set()
+    for token in _NUMBER_RE.findall(text or ""):
+        digits = token.replace(",", "")
+        if digits.isdigit():
+            found.add(int(digits))
+    for token in _K_NUMBER_RE.findall(text or ""):
+        try:
+            found.add(int(round(float(token) * 1000)))
+        except ValueError:
+            continue
+    return found
+
+
+def _friction_allowed_facts(
+    customer_message: str,
+    customer: Optional[dict],
+    conversation_history: Optional[list],
+    catalog_context: Optional[list],
+    store_facts: Optional[dict],
+) -> tuple:
+    """Collect every number and URL the reply is allowed to repeat."""
+    blobs = [customer_message or ""]
+    blobs.append(json.dumps(customer or {}, ensure_ascii=False, default=str))
+    blobs.append(json.dumps(catalog_context or [], ensure_ascii=False, default=str))
+    blobs.append(json.dumps(store_facts or {}, ensure_ascii=False, default=str))
+    for item in (conversation_history or [])[-8:]:
+        if isinstance(item, dict):
+            blobs.append(str(item.get("message") or ""))
+    text = "\n".join(blobs)
+    urls = {url.rstrip(".,!?;:") for url in _URL_RE.findall(text)}
+    return _numbers_in(text), urls
+
+
+def _friction_reply_language_ok(text: str, language: str) -> bool:
+    has_telugu_script = bool(re.search(r"[\u0C00-\u0C7F]", text))
+    if language == "telugu":
+        return has_telugu_script
+    if language == "roman_telugu":
+        return (not has_telugu_script) and bool(_ROMAN_REPLY_MARKERS.search(text))
+    return False  # English is never an output language.
+
+
+def _validate_friction_reply(
+    text: Optional[str],
+    *,
+    language: str,
+    customer_message: str,
+    customer: Optional[dict],
+    conversation_history: Optional[list],
+    catalog_context: Optional[list],
+    store_facts: Optional[dict],
+) -> Optional[str]:
+    """Return a safe reply, or None when anything looks invented or off-policy."""
+    reply = str(text or "").strip().strip('"').strip()
+    if not reply or len(reply) > FRICTION_MAX_REPLY_CHARS:
+        return None
+    if not _friction_reply_language_ok(reply, language):
+        return None
+    if _FAKE_ACTION_CLAIM.search(reply) or _INTERNAL_LEAK.search(reply):
+        return None
+
+    allowed_numbers, allowed_urls = _friction_allowed_facts(
+        customer_message, customer, conversation_history, catalog_context, store_facts,
+    )
+    for url in _URL_RE.findall(reply):
+        if url.rstrip(".,!?;:") not in allowed_urls:
+            return None
+    # Any amount, battery percentage or long number must come from supplied facts.
+    for token in _NUMBER_RE.findall(reply):
+        digits = token.replace(",", "").strip()
+        if not digits.isdigit():
+            continue
+        value = int(digits)
+        if value >= 1000 and value not in allowed_numbers:
+            return None
+    for match in re.finditer(r"(\d{2,3})\s*%", reply):
+        if int(match.group(1)) not in allowed_numbers:
+            return None
+    return reply
+
+
+def answer_unhandled_message(
+    customer_message: str,
+    language: str,
+    customer: Optional[dict] = None,
+    conversation_history: Optional[list] = None,
+    catalog_context: Optional[list] = None,
+    store_facts: Optional[dict] = None,
+) -> Optional[str]:
+    """Answer a message the rule-based flow could not understand.
+
+    Returns a validated reply in the locked language, or None when the LLM is
+    disabled, fails, or produces anything the validator rejects. A None result
+    is never an error: the caller falls back to a deterministic template.
+    """
+    message = (customer_message or "").strip()
+    if not message or language not in {"telugu", "roman_telugu"}:
+        return None
+    if _llm_provider() == "none":
+        return None
+
+    prompt = build_unhandled_message_prompt(
+        customer_message=message,
+        response_language=language,
+        customer=customer,
+        conversation_history=conversation_history,
+        catalog_context=catalog_context,
+        store_facts=store_facts,
+    )
+    try:
+        generated = _call_text_model(
+            BUSINESS_SYSTEM_PROMPT, prompt, temperature=0.3, json_mode=False,
+        )
+    except Exception as exc:  # _call_text_model already guards; stay defensive.
+        print("Unhandled-message LLM call failed:", type(exc).__name__)
+        return None
+
+    validated = _validate_friction_reply(
+        generated,
+        language=language,
+        customer_message=message,
+        customer=customer,
+        conversation_history=conversation_history,
+        catalog_context=catalog_context,
+        store_facts=store_facts,
+    )
+    if generated and not validated:
+        print("Unhandled-message LLM reply rejected by validator; using template.")
+    return validated
