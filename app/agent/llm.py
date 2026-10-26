@@ -3421,6 +3421,20 @@ def _localized_fallback(
 # ---------------------------------------------------------
 
 
+def _locked_customer_response_language(language: Optional[str]) -> str:
+    """Enforce the store agent's two supported customer-facing languages.
+
+    The conversation layer owns first-message language locking. This helper
+    deliberately does not redetect language from each new message: Telugu
+    script stays Telugu; every other/unknown response language uses Roman Telugu.
+    Extraction can still use ``detect_language`` independently.
+    """
+    normalized = str(language or "").strip().lower().replace("-", "_")
+    if normalized in {"telugu", "te", "telugu_script"}:
+        return "telugu"
+    return "roman_telugu"
+
+
 def generate_response(
     draft_response: str,
     customer_message: str,
@@ -3442,8 +3456,11 @@ def generate_response(
     if not draft_response:
         return ""
 
-    if language not in {"english", "telugu", "roman_telugu"}:
-        language = detect_language(customer_message)
+    # Customer-facing responses must follow the business policy: Telugu script
+    # only when the conversation's locked language is Telugu; otherwise use
+    # Roman Telugu, even when the customer typed English. Do not redetect from
+    # each incoming message because that would switch languages mid-conversation.
+    language = _locked_customer_response_language(language)
 
     customer = customer or {}
     conversation_history = conversation_history or []
@@ -3724,8 +3741,13 @@ def answer_unhandled_message(
     is never an error: the caller falls back to a deterministic template.
     """
     message = (customer_message or "").strip()
-    if not message or language not in {"telugu", "roman_telugu"}:
+    if not message:
         return None
+
+    # Keep fallback replies in the same locked customer-facing language policy
+    # as normal generated responses. English messages use Roman Telugu.
+    language = _locked_customer_response_language(language)
+
     if _llm_provider() == "none":
         return None
 

@@ -52,9 +52,15 @@ _CONDITION_ALIASES = {
 
 def _normalise_stock_status(value: Any) -> str:
     status = re.sub(r"[\s-]+", "_", str(value or "").strip().lower())
-    if status in {"instock", "in_stock", "available", "available_now", "yes"}:
+    if status in {
+        "instock", "in_stock", "available", "available_now", "yes",
+        "true", "1", "in stock", "ready_stock",
+    }:
         return "in_stock"
-    if status in {"outofstock", "out_of_stock", "unavailable", "sold_out", "no"}:
+    if status in {
+        "outofstock", "out_of_stock", "unavailable", "sold_out", "no",
+        "false", "0", "out of stock", "not_available",
+    }:
         return "out_of_stock"
     return "unknown"
 
@@ -311,13 +317,44 @@ def _attribute(product: dict, *names: str) -> Any:
     return None
 
 
+def _variant_is_in_stock(variant: dict) -> bool:
+    """Return True only when a variant explicitly indicates it is in stock."""
+    if not isinstance(variant, dict):
+        return False
+
+    # Prefer the explicit variant flag when it is a real boolean.
+    flag = variant.get("in_stock")
+    if isinstance(flag, bool):
+        return flag
+    if isinstance(flag, str):
+        normalized_flag = flag.strip().lower()
+        if normalized_flag in {"true", "1", "yes", "available", "in_stock", "instock"}:
+            return True
+        if normalized_flag in {"false", "0", "no", "unavailable", "out_of_stock", "outofstock"}:
+            return False
+
+    # Some catalog imports store availability in a status field instead.
+    for key in ("stock_status", "availability", "status"):
+        value = variant.get(key)
+        if value not in (None, ""):
+            status = _normalise_stock_status(value)
+            if status == "in_stock":
+                return True
+            if status == "out_of_stock":
+                return False
+    return False
+
+
 def get_available_variants(product: dict) -> list[dict]:
+    """Return variants explicitly marked as available; unknown is not in stock."""
     variants = product.get("variants") or []
+    if isinstance(variants, str):
+        variants = _as_list(variants)
     if not isinstance(variants, list):
         return []
     return [
         item for item in variants
-        if isinstance(item, dict) and item.get("in_stock") is True
+        if isinstance(item, dict) and _variant_is_in_stock(item)
     ]
 
 

@@ -154,6 +154,12 @@ EXTRA_FIELDS = {
     "model",
 
     "shopping_mode",
+    # Persist budget/availability follow-up requests in the existing customer
+    # JSON so the dashboard can display them without a schema migration.
+    "availability_notification_requested",
+    "availability_notification_model",
+    "availability_notification_budget",
+    "availability_notification_status",
 
 }
 
@@ -872,6 +878,35 @@ def _catalog_price_sort_value(product: dict) -> float:
         return value if value >= 0 else float("inf")
     except (TypeError, ValueError, OverflowError):
         return float("inf")
+
+
+def _customer_budget_ceiling(customer: dict) -> Optional[float]:
+    """Return a customer-stated budget ceiling; never use inferred interest bands."""
+    if not isinstance(customer, dict):
+        return None
+
+    budget = customer.get("budget")
+    if isinstance(budget, dict):
+        for key in ("max", "maximum", "budget_max", "amount"):
+            try:
+                value = float(budget.get(key))
+                if value > 0:
+                    return value
+            except (TypeError, ValueError, AttributeError):
+                continue
+        return None
+
+    for key in ("budget_max", "budget_amount", "target_price", "budget"):
+        value = customer.get(key)
+        if isinstance(value, dict):
+            continue
+        try:
+            numeric = float(value)
+            if numeric > 0:
+                return numeric
+        except (TypeError, ValueError, OverflowError):
+            continue
+    return None
 
 
 def _remember_inferred_interest_band(customer: dict, product: dict) -> None:
@@ -3381,7 +3416,11 @@ def _process_message_impl(
 
     # Compact sales flow: return catalog options first if the customer's
     # model/condition/storage/battery description still maps to several rows.
-    if session.get("compact_sales_flow") and _is_specific_model_name(current_product):
+    if (
+        session.get("compact_sales_flow")
+        and _is_specific_model_name(current_product)
+        and not intent_followup
+    ):
         try:
             model_variants = _catalog_products_for_model(current_product)
             selected_variants = _catalog_products_for_model(
@@ -3410,6 +3449,90 @@ def _process_message_impl(
                     conditioned = [item for item in selected_variants if _catalog_is_new(item)]
                     if conditioned:
                         selected_variants = conditioned
+
+            # If the customer-stated budget is below every known catalog price,
+            # record a follow-up request and ask one explicit purchase-intent
+            # question. Do not claim an automatic notification service exists:
+            # this is persisted for the existing dashboard/team follow-up flow.
+            stated_budget = _customer_budget_ceiling(customer)
+            priced_variants = [
+                item for item in selected_variants
+                if _catalog_price_sort_value(item) != float("inf")
+                and item.get("price_needs_verification") is False
+            ]
+            affordable_variants = [
+                item for item in priced_variants
+                if _catalog_price_sort_value(item) <= stated_budget
+            ] if stated_budget is not None else list(selected_variants)
+
+            previous_request = (
+                customer.get("availability_notification_requested")
+                and str(customer.get("availability_notification_model") or "").casefold()
+                == current_product.casefold()
+                and str(customer.get("availability_notification_budget") or "") == str(int(stated_budget))
+            ) if stated_budget is not None else False
+            if stated_budget is not None and priced_variants and not affordable_variants and not previous_request:
+                budget_label = f"₹{stated_budget:,.0f}"
+                customer["availability_notification_requested"] = True
+                customer["availability_notification_model"] = current_product
+                customer["availability_notification_budget"] = int(stated_budget)
+                customer["availability_notification_status"] = "pending_team_follow_up"
+                customer["budget_source"] = "customer_stated"
+                session["asked_field"] = "intent"
+                session["intent_question_asked"] = True
+
+                intent = session.get("intent") or {"score": 0, "status": "low", "signals": []}
+                signals = intent.setdefault("signals", [])
+                signal = "Requested notification/follow-up if product becomes available within stated budget"
+                if signal not in signals:
+                    signals.append(signal)
+                score_value = int(intent.get("score", 0) or 0)
+                intent["status"] = (
+                    "very_high" if score_value >= 80 else
+                    "high" if score_value >= 60 else
+                    "medium" if score_value >= 40 else "low"
+                )
+                session["intent"] = intent
+                session["intent_history"] = session.setdefault("intent_history", [])
+                session["intent_history"].append({
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "score": intent.get("score", 0),
+                    "status": intent.get("status", "low"),
+                    "signals": list(signals),
+                    "reason": signal,
+                })
+
+                if active_language == "telugu":
+                    budget_reply = (
+                        f"క్షమించండి బ్రో, {budget_label} బడ్జెట్‌లో {current_product}కి సరిపోయే ధృవీకరించిన ధర ఉన్న ఆప్షన్ ప్రస్తుతం కాటలాగ్‌లో కనిపించడం లేదు. "
+                        f"ఈ బడ్జెట్‌లో దొరికితే మీకు అప్‌డేట్ ఇవ్వడానికి రిక్వెస్ట్‌ను టీమ్ ఫాలో-అప్ కోసం నమోదు చేశాను. "
+                        "ఆటోమేటిక్ అలర్ట్ అందుబాటులో ఉందని మాత్రం హామీ ఇవ్వలేను. "
+                        "ఈ బడ్జెట్‌లో ఈ మోడల్ దొరికితే కొనడానికి ఆసక్తిగా ఉన్నారా, బ్రో?"
+                    )
+                else:
+                    budget_reply = (
+                        f"Sorry bro, {current_product} ki {budget_label} budget lo match ayye verified-price option catalog lo ippudu kanipinchadam ledu. "
+                        "Ee budget lo dorikithe update kosam mee request ni team follow-up ki note chesanu. "
+                        "Automatic alert available ani guarantee cheyyalenu. "
+                        "Ee budget lo ee model dorikithe konadaniki interested ga unnara bro?"
+                    )
+                session["_return_template_reply"] = True
+                return {
+                    "customer_id": customer_id,
+                    "message": budget_reply,
+                    "customer": customer,
+                    "qualification": session.get("qualification"),
+                    "intent": intent,
+                    "intent_history": session.get("intent_history", []),
+                    "lead_id": session.get("lead_id"),
+                    "lead_saved": bool(session.get("lead_saved")),
+                    "notification_request_recorded": True,
+                }
+
+            # If a lower-priced catalog option fits the stated budget, narrow
+            # the choices to those options before asking the customer to choose.
+            if stated_budget is not None and affordable_variants:
+                selected_variants = affordable_variants
 
             # If the requested battery health is absent, never substitute another
             # battery level's price. Show real alternatives and ask one choice.
@@ -4688,34 +4811,40 @@ def _last_turn_text(history: list, sender: str) -> str:
 
 
 def _is_repeated_reply(reply: str, session: dict, message: str) -> bool:
-    """True when the flow is about to send the same reply as last turn.
+    """Detect a response already sent anywhere in this conversation.
 
-    A repeated reply to a *new* customer message means the rules did not
-    understand it (e.g. "Battery health ante enti?" answered with the same
-    product list again). A customer re-sending the same text (WhatsApp retry or
-    impatience) is not friction, so identical customer messages are excluded.
+    A repeated reply to a new customer message means the rules did not
+    understand it (for example, a battery-health question answered with the
+    same product list). Identical inbound retries are excluded to avoid
+    treating a Meta webhook retry as a new conversational turn.
     """
     history = session.get("conversation_history") or []
     current = _normalize_reply_text(reply)
-    if not current or len(current) < 20:
+    if not current:
         return False
-    previous_assistant = _last_turn_text(history, "assistant")
-    if not previous_assistant or current != previous_assistant:
+
+    prior_assistant_replies = {
+        _normalize_reply_text(item.get("message"))
+        for item in history
+        if isinstance(item, dict) and item.get("sender_type") == "assistant"
+        and _normalize_reply_text(item.get("message"))
+    }
+    if current not in prior_assistant_replies:
         return False
-    # The current turn may or may not be recorded yet; drop it, then compare
-    # with the customer's previous message.
+
     wanted = _normalize_reply_text(message)
     customer_turns = [
         _normalize_reply_text(item.get("message"))
         for item in history
-        # Customer turns are stored without sender_type; storage defaults them to "customer".
-        if isinstance(item, dict) and item.get("sender_type", "customer") != "assistant"
+        if isinstance(item, dict)
+        and item.get("sender_type", "customer") != "assistant"
     ]
+    # The current inbound turn may already have been recorded by the core flow.
     if customer_turns and customer_turns[-1] == wanted:
-        customer_turns = customer_turns[:-1]
-    if customer_turns and customer_turns[-1] == wanted:
-        return False
-    return True
+        customer_turns.pop()
+    # A repeated inbound message is likely a retry or the customer repeating
+    # themselves; don't trigger a new LLM call solely because of that retry.
+    return not (customer_turns and customer_turns[-1] == wanted)
 
 
 def _process_message_serialized(customer_id: str, message: str) -> dict:
@@ -4915,6 +5044,21 @@ def _process_message_serialized(customer_id: str, message: str) -> dict:
                 friction_language = _resolve_response_language(message, live_session)
                 friction_reply = _llm_unhandled_reply(message, live_session, friction_language)
                 if friction_reply:
+                    # If the LLM also repeats an earlier answer, use a distinct
+                    # clarification tied to the current message. Never silently
+                    # send an identical assistant response twice in one session.
+                    if _is_repeated_reply(friction_reply, live_session, message):
+                        safe_clarification = _unhandled_clarification(
+                            friction_language, live_session.get("customer", {})
+                        )
+                        if _is_repeated_reply(safe_clarification, live_session, message):
+                            safe_clarification = (
+                                f"Meeru ippudu '{message[:120]}' gurinchi adigaru bro. "
+                                "Daaniki exact ga answer ivvadaniki model/variant ni konchem clarify chesthara?"
+                                if friction_language != "telugu" else
+                                f"మీరు ఇప్పుడు '{message[:120]}' గురించి అడిగారు బ్రో. ఖచ్చితంగా సహాయం చేయడానికి మోడల్ లేదా వేరియంట్‌ను కొంచెం స్పష్టంగా చెబుతారా?"
+                            )
+                        friction_reply = safe_clarification
                     result["message"] = friction_reply
 
     session = _get_session(customer_id)

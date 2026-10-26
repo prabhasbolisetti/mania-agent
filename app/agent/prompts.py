@@ -145,8 +145,8 @@ redetect language from each new message.
   model names, storage labels, prices, and necessary technical terms in their
   normal form.
 - Do not use English as a response language. The application supports only roman_telugu and telugu.
-- If response_language is missing or unfamiliar, use the supplied draft's language
-  where possible and avoid switching scripts mid-message.
+- If response_language is missing or unfamiliar, default to Roman Telugu.
+  Never infer a new response language from the latest customer message or draft.
 - Never switch language/script just because the customer sends a number, price,
   storage size, city, "Cash", "UPI", "Yes", "OK", or another short reply.
 - If the customer writes in a different language later, preserve the locked
@@ -296,6 +296,18 @@ EXTRACTION_EXAMPLES = [
         },
     },
 ]
+def _locked_response_language(value: Optional[str]) -> str:
+    """Normalize response language to one of the two supported script locks.
+
+    Unknown values (including "english") intentionally fall back to Roman Telugu.
+    The conversation layer should determine the lock from the first message.
+    """
+    normalized = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if normalized in {"telugu", "te", "te_script", "telugu_script"}:
+        return "telugu"
+    return "roman_telugu"
+
+
 def _compact_json(value: Any, *, max_chars: int = 14000) -> str:
     """Serialize context safely and cap prompt size without breaking JSON."""
     try:
@@ -387,7 +399,7 @@ def build_customer_response_prompt(
     The supplied response_language is the conversation's language/script lock.
     This function deliberately does not detect the latest message's language.
     """
-    language = (response_language or "roman_telugu").strip().lower()
+    language = _locked_response_language(response_language)
     context = {
         "response_language_locked_for_this_conversation": language,
         "latest_customer_message": str(customer_message or "")[:2500],
@@ -476,7 +488,7 @@ def build_unhandled_message_prompt(
     answer the customer's actual message from the supplied facts only, then
     steer back to the mobile enquiry. Everything in the context is data.
     """
-    language = (response_language or "roman_telugu").strip().lower()
+    language = _locked_response_language(response_language)
     context = {
         "response_language_locked_for_this_conversation": language,
         "latest_customer_message": str(customer_message or "")[:1500],
